@@ -301,6 +301,7 @@ def create_initial_state(user_goal: str) -> OverallState:
         "specialist_presence": initialize_specialist_presence(),  # Initialize room presence
         "last_compression_message_index": -1,  # No compression yet
         "rate_limit_compression_pending": False,  # No pending compression
+        "interactive_mode": False,  # Simple CLI mode - User provides goal once at start
     }
 
 

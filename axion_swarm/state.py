@@ -18,3 +18,4 @@ class OverallState(TypedDict):
     last_compression_message_index: int  # Index of last compression point (Chair summary)
     rate_limit_compression_pending: bool  # True if we need to do rate-limit compression
     checkpoint_saved_this_phase: bool  # True if checkpoint was saved before stagnation detection (skip regular checkpoint)
+    interactive_mode: bool  # True if running in interactive TUI mode (enables User engagement signals in stagnation detection)

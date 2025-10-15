@@ -51,11 +51,16 @@ def update_remaining_agents(agent_name: str):
 
 
 def save_checkpoint_node(state: OverallState) -> dict:
-    """Save checkpoint after phase completes, before starting next phase.
+    """Save checkpoint JUST BEFORE starting the next phase.
+    
+    This is called after:
+    - Current phase execution completes
+    - User has answered any pending questions (TUI blocks until answered)
+    - check_continuation decides to continue
     
     This ensures the checkpoint is atomically written and flushed to disk
-    before proceeding to the next phase. If the program crashes or is
-    interrupted, we can resume from this checkpoint.
+    in a clean state before starting the next phase. If the program crashes
+    during the next phase, we can resume from this clean checkpoint.
     
     SKIP if checkpoint was already saved this phase (e.g., before stagnation detection).
     """
@@ -107,19 +112,20 @@ def create_swarm_graph():
     # After executing all agents, check continuation
     workflow.add_edge("execute_phase", "check_continuation")
     
-    # After checking continuation, save checkpoint (atomic, fsynced to disk)
-    # This ensures we can resume from this point if interrupted
-    workflow.add_edge("check_continuation", "save_checkpoint")
-    
-    # After saving checkpoint, either start new phase or end
+    # After checking continuation, decide whether to save checkpoint and continue or end
+    # Checkpoint is saved JUST BEFORE starting the next phase (after user answers questions)
     workflow.add_conditional_edges(
-        "save_checkpoint",
+        "check_continuation",
         route_continuation,
         {
-            "start_phase": "start_phase",
-            "__end__": END,
+            "start_phase": "save_checkpoint",  # Save before next phase
+            "__end__": END,  # End immediately without checkpoint
         }
     )
+    
+    # After saving checkpoint, start the next phase
+    # This ensures we can resume from a clean state if interrupted during next phase
+    workflow.add_edge("save_checkpoint", "start_phase")
     
     print(f"[GRAPH] Provider: {config.provider}, Max Concurrency: {config.max_concurrency}", file=sys.stderr)
     if config.parallel_execution:

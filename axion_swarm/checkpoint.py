@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import hashlib
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -190,7 +191,7 @@ def save_checkpoint(state: Dict[str, Any], checkpoint_path: Optional[Path] = Non
         finally:
             os.close(parent_fd)
         
-        print(f"💾 Checkpoint saved and synced to disk: {checkpoint_path} (Phase {checkpoint_data['phase_number']})", flush=True)
+        print(f"💾 Checkpoint saved and synced to disk: {checkpoint_path} (Phase {checkpoint_data['phase_number']})", file=sys.stderr, flush=True)
     
     except Exception as e:
         # Clean up temp file if something went wrong

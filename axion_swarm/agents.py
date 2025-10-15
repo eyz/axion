@@ -559,6 +559,24 @@ def get_display_name(role_key: str) -> str:
     return display_names.get(role_key, f"{role_key} specialist")
 
 
+def format_name_list(names: list[str]) -> str:
+    """Format a list of names with proper English grammar (Oxford comma).
+    
+    Examples:
+        ["Alice"] -> "Alice"
+        ["Alice", "Bob"] -> "Alice and Bob"
+        ["Alice", "Bob", "Charlie"] -> "Alice, Bob, and Charlie"
+    """
+    if len(names) == 0:
+        return ""
+    elif len(names) == 1:
+        return names[0]
+    elif len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    else:
+        return ", ".join(names[:-1]) + f", and {names[-1]}"
+
+
 def find_role_key_by_display_name(display_name: str) -> str | None:
     """
     Map display name like 'Cloud Infrastructure specialist' to role_key like 'cloudarchitect'.
@@ -771,7 +789,9 @@ def create_agent_func(name: str, system_prompt: str, agent_config: AgentConfig, 
         llm = get_llm(name, agent_config)
         
         # Check if this is the final phase - use different system prompt
-        is_final = state.get("final_phase_needed", False)
+        # BUG FIX: Check BOTH final_phase_needed (for upcoming final) AND final_phase_done (for current final)
+        # This ensures specialists recognize they're IN the final phase even before Chair runs
+        is_final = state.get("final_phase_needed", False) or state.get("final_phase_done", False)
         
         if is_final:
             # Extract just the role description (without BASE_INSTRUCTION rules)
@@ -1977,40 +1997,41 @@ def check_discussion_stagnation(state: OverallState, current_synthesis: str, cur
     justification_signals = []
     total_justification = 0.0
     
-    # Justification 1: Recent User engagement (DISABLED)
-    # RATIONALE: Current implementation doesn't allow user interaction during multi-phase discussion
-    # This signal will be re-enabled when interactive user participation is implemented
-    # if user_silence_phases == 0:
-    #     recent_user_score = -0.30
-    #     justification_signals.append({
-    #         "factor": "Recent User response",
-    #         "value": f"User responded in Phase {last_user_phase}",
-    #         "probability": recent_user_score,
-    #         "rationale": "Active User engagement justifies continued discussion"
-    #     })
-    #     total_justification += recent_user_score
-    # elif user_silence_phases == 1:
-    #     recent_user_score = -0.15
-    #     justification_signals.append({
-    #         "factor": "Recent User response",
-    #         "value": f"User responded 1 phase ago (Phase {last_user_phase})",
-    #         "probability": recent_user_score,
-    #         "rationale": "User engaged recently, may be processing responses"
-    #     })
-    #     total_justification += recent_user_score
+    # Justification 1: Recent User engagement (CONDITIONAL - only in interactive mode)
+    # RATIONALE: Only meaningful when User can participate during discussion
+    # Simple CLI mode: User provides goal once at start, then silent
+    # Interactive TUI mode: User can send messages at any phase
+    interactive_mode = state.get("interactive_mode", False)
     
-    # Justification 2: High User engagement (DISABLED)
-    # RATIONALE: Current implementation doesn't allow user interaction during multi-phase discussion
-    # This signal will be re-enabled when interactive user participation is implemented
-    # if user_message_count >= 3:
-    #     engagement_justification = -0.20
-    #     justification_signals.append({
-    #         "factor": "High User engagement",
-    #         "value": f"{user_message_count} User messages",
-    #         "probability": engagement_justification,
-    #         "rationale": "Multiple User inputs show active collaboration"
-    #     })
-    #     total_justification += engagement_justification
+    if interactive_mode and user_silence_phases == 0:
+        recent_user_score = -0.30
+        justification_signals.append({
+            "factor": "Recent User response",
+            "value": f"User responded in Phase {last_user_phase}",
+            "probability": recent_user_score,
+            "rationale": "Active User engagement justifies continued discussion"
+        })
+        total_justification += recent_user_score
+    elif interactive_mode and user_silence_phases == 1:
+        recent_user_score = -0.15
+        justification_signals.append({
+            "factor": "Recent User response",
+            "value": f"User responded 1 phase ago (Phase {last_user_phase})",
+            "probability": recent_user_score,
+            "rationale": "User engaged recently, may be processing responses"
+        })
+        total_justification += recent_user_score
+    
+    # Justification 2: High User engagement (CONDITIONAL - only in interactive mode)
+    if interactive_mode and user_message_count >= 3:
+        engagement_justification = -0.20
+        justification_signals.append({
+            "factor": "High User engagement",
+            "value": f"{user_message_count} User messages",
+            "probability": engagement_justification,
+            "rationale": "Multiple User inputs show active collaboration"
+        })
+        total_justification += engagement_justification
     
     # Justification 3: Recent search/research activity (-0.18)
     # New external information justifies continuation + synthesis phase
@@ -2163,11 +2184,32 @@ def check_discussion_stagnation(state: OverallState, current_synthesis: str, cur
         # Show justification signals (NEGATIVE - reduce probability)
         print(f"\nJUSTIFICATION SIGNALS (negative contributions):", file=sys.stderr)
         
-        # Justification 1: Recent User engagement (DISABLED)
-        print(f"  1. Recent User Response: DISABLED (no user interaction during multi-phase discussion)", file=sys.stderr)
+        # Justification 1: Recent User engagement (CONDITIONAL - only in interactive mode)
+        if not interactive_mode:
+            print(f"  1. Recent User Response: DISABLED (simple CLI mode - user only provides initial goal)", file=sys.stderr)
+        elif user_silence_phases == 0:
+            print(f"  1. Recent User Response:", file=sys.stderr)
+            print(f"     Formula: -0.30 (user spoke this phase)", file=sys.stderr)
+            print(f"     Value: User spoke in Phase {last_user_phase}", file=sys.stderr)
+            print(f"     Contribution: -0.3000 (-30.0%)", file=sys.stderr)
+        elif user_silence_phases == 1:
+            print(f"  1. Recent User Response:", file=sys.stderr)
+            print(f"     Formula: -0.15 (user spoke 1 phase ago)", file=sys.stderr)
+            print(f"     Value: User spoke in Phase {last_user_phase}", file=sys.stderr)
+            print(f"     Contribution: -0.1500 (-15.0%)", file=sys.stderr)
+        else:
+            print(f"  1. Recent User Response: +0.0000 (user silence={user_silence_phases} phases)", file=sys.stderr)
         
-        # Justification 2: High User engagement (DISABLED)
-        print(f"  2. High User Engagement: DISABLED (no user interaction during multi-phase discussion)", file=sys.stderr)
+        # Justification 2: High User engagement (CONDITIONAL - only in interactive mode)
+        if not interactive_mode:
+            print(f"  2. High User Engagement: DISABLED (simple CLI mode - user only provides initial goal)", file=sys.stderr)
+        elif user_message_count >= 3:
+            print(f"  2. High User Engagement:", file=sys.stderr)
+            print(f"     Formula: -0.20 (message_count >= 3)", file=sys.stderr)
+            print(f"     Value: {user_message_count} User messages total", file=sys.stderr)
+            print(f"     Contribution: -0.2000 (-20.0%)", file=sys.stderr)
+        else:
+            print(f"  2. High User Engagement: +0.0000 (user_messages={user_message_count}<3)", file=sys.stderr)
         
         # Justification 3: Research activity
         if search_tool_count >= 2:
@@ -2904,6 +2946,8 @@ async def execute_phase_parallel(state: OverallState) -> dict:
     # Separate Chair from other specialists
     non_chair_agents = [a for a in agents_this_phase if a != "chair"]
     
+    print(f"[DEBUG] Phase {current_phase}: Executing {len(non_chair_agents)} non-Chair specialists: {non_chair_agents}", file=sys.stderr, flush=True)
+    
     # Map agent names to their functions
     agent_func_map = {
         "context": context_agent,
@@ -2927,6 +2971,10 @@ async def execute_phase_parallel(state: OverallState) -> dict:
     # Execute non-Chair specialists in parallel (Azure) or sequential (Ollama via semaphore)
     # CRITICAL: All specialists must complete as one atomic group BEFORE Chair executes
     
+    # NOTE: "Thinking" notice is now added in start_phase (before this node executes)
+    # so TUI sees it immediately before parallel processing starts
+    all_messages = []
+    
     # Create tasks for all non-Chair specialists
     tasks_list = []
     task_names = []
@@ -2948,9 +2996,14 @@ async def execute_phase_parallel(state: OverallState) -> dict:
     for agent_name in non_chair_agents:
         result = specialist_results_dict[agent_name]
         if "messages" in result:
+            msg_count = len(result["messages"])
+            print(f"[DEBUG] Phase {current_phase}: {agent_name} returned {msg_count} message(s)", file=sys.stderr, flush=True)
             specialist_messages.extend(result["messages"])
+        else:
+            print(f"[DEBUG] Phase {current_phase}: {agent_name} returned NO messages", file=sys.stderr, flush=True)
     
-    all_messages = list(specialist_messages)  # Start with specialist messages
+    # Add specialist messages after the thinking notice
+    all_messages.extend(specialist_messages)
     
     # Phase-level tool request deduplication: Process Search and ReadURL requests
     # Collect all @[Search] queries and @[ReadURL] URLs from all specialist messages
@@ -3188,7 +3241,7 @@ def start_phase(state: OverallState) -> dict:
         user_question = state.get("user_goal", "")
         user_timestamp = datetime.now().astimezone().isoformat(timespec='milliseconds')
         user_msg = AIMessage(
-            content=f'Specialists, please help me with this concern: "{user_question}"',
+            content=user_question,
             name="User",
             additional_kwargs={"phase": 1, "timestamp": user_timestamp}  # User message is part of Phase 1
         )
@@ -3317,6 +3370,43 @@ def start_phase(state: OverallState) -> dict:
     
     # Add Chair at the end (conditional participation logic unchanged)
     agents_for_phase = active_specialists + ["chair"]
+    
+    # CRITICAL: Add "thinking" notice BEFORE execute_phase starts
+    # This ensures TUI displays it IMMEDIATELY before parallel processing
+    # BUT: Skip if TUI just added one (when user cleared last "?" and auto-resumed)
+    non_chair_specialists = [agent for agent in agents_for_phase if agent != "chair"]
+    should_add_thinking_notice = False
+    
+    if non_chair_specialists:
+        # Check if last message is already a thinking notice for this phase
+        existing_messages = state.get("messages", [])
+        last_msg = existing_messages[-1] if existing_messages else None
+        is_duplicate_thinking = (
+            last_msg and 
+            hasattr(last_msg, 'name') and last_msg.name == "Notice" and
+            hasattr(last_msg, 'content') and "are thinking" in last_msg.content and "🧠" in last_msg.content and
+            hasattr(last_msg, 'additional_kwargs') and last_msg.additional_kwargs.get("phase") == phase_num
+        )
+        
+        if not is_duplicate_thinking:
+            should_add_thinking_notice = True
+            specialist_display_names = [get_display_name(agent_name) for agent_name in non_chair_specialists]
+            # Format names with @[...] for colorization in TUI
+            specialist_mentions = [f"@[{name}]" for name in specialist_display_names]
+            thinking_notice = f"{format_name_list(specialist_mentions)} are thinking... 🧠"
+            
+            thinking_timestamp = datetime.now().astimezone().isoformat(timespec='milliseconds')
+            thinking_msg = AIMessage(
+                content=f"Notice: {thinking_notice}\n",  # Add newline for visual separation
+                name="Notice",
+                additional_kwargs={"phase": phase_num, "timestamp": thinking_timestamp}
+            )
+            messages_to_add.append(thinking_msg)
+            
+            # Also print to stderr for debugging
+            print(f"Notice: {thinking_notice}", file=sys.stderr, flush=True)
+        else:
+            print(f"[DEBUG] Skipping duplicate thinking notice for Phase {phase_num} (already added by TUI)", file=sys.stderr, flush=True)
     
     result = {
         "phase_number": phase_num,

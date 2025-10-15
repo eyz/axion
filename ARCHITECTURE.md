@@ -1,5 +1,81 @@
 # Axion Swarm - Architecture Documentation
 
+## Table of Contents
+
+### Core Concepts
+- [Project Overview](#project-overview)
+  - [Project Goal: Natural Human-Like Expert Discussion](#project-goal-natural-human-like-expert-discussion)
+  - [The Fundamental Model: Internal Expert Team with Async Collaboration](#the-fundamental-model-internal-expert-team-with-async-collaboration)
+  - [How the Architecture Supports Collaborative User Participation](#how-the-architecture-supports-collaborative-user-participation)
+- [Terminology: Phase vs. Stage](#terminology-phase-vs-stage)
+- [Core Architecture](#core-architecture)
+  - [Multi-Agent Culture (Shared Foundation)](#multi-agent-culture-shared-foundation)
+  - [Agent Roster (Dynamic)](#agent-roster-dynamic)
+  - [Role Description System - Dual Perspective Architecture](#role-description-system---dual-perspective-architecture)
+  - [Execution Order Per Phase](#execution-order-per-phase)
+  - [Chair's Tabling Authority - Conflict Resolution](#chairs-tabling-authority---conflict-resolution)
+  - [Chair's On-Topic Enforcement](#chairs-on-topic-enforcement)
+  - [Chair's Stagnation Detection (Phase 4+)](#chairs-stagnation-detection-phase-4)
+
+### Phase System
+- [The 4-Stage Conversation System](#the-4-stage-conversation-system)
+  - [Stage 1: Phase 1 - Independent Fresh Perspectives](#stage-1-phase-1---independent-fresh-perspectives-initial-assessment)
+  - [Stage 2: Phase 2 - Review Others](#stage-2-phase-2---review-others-initial-assessment-cross-pollination)
+  - [Stage 3: Phase 3+ - Continuing Conversation](#stage-3-phase-3---continuing-conversation-iterative-discussion)
+  - [Stage 4: Final Phase - Wrap Up](#stage-4-final-phase---wrap-up-without-further-user-input-settlement)
+
+### Output & Formatting
+- [Primary Output](#primary-output)
+- [Output Stream Architecture](#output-stream-architecture)
+- [Colorization System](#colorization-system)
+- [Timestamp System](#timestamp-system)
+- [Internal Reasoning & Thinking](#internal-reasoning--thinking)
+- [User Message](#user-message)
+- [Notice Messages](#notice-messages)
+- [Response Format Requirements](#response-format-requirements)
+
+### System Architecture
+- [Agent Isolation & Fresh LLM Instances](#agent-isolation--fresh-llm-instances)
+- [Progressive Retraction System](#progressive-retraction-system)
+- [Message History Construction](#message-history-construction)
+- [Configuration System](#configuration-system)
+- [State Management](#state-management)
+- [Graph Workflow](#graph-workflow)
+  - [Node Structure (Current - Parallel Execution)](#node-structure-current---parallel-execution)
+  - [Phase Tracking](#phase-tracking)
+  - [Continuation Logic](#continuation-logic)
+
+### Interactive TUI Mode
+- [Interactive TUI Mode (2025-10-14)](#interactive-tui-mode-2025-10-14)
+  - [Overview](#overview)
+  - [Architecture Separation](#architecture-separation)
+  - [Key Features](#key-features)
+  - [User Engagement Flow](#user-engagement-flow)
+  - [Final Phase Invalidation Details](#final-phase-invalidation-details)
+- [TUI (Terminal User Interface) Architecture](#tui-terminal-user-interface-architecture)
+  - [Core UX Principle: NEVER Block User Feedback](#core-ux-principle-never-block-user-feedback)
+  - [TUI Features](#tui-features)
+  - [Message Flow Architecture](#message-flow-architecture)
+  - [Stderr Capture System](#stderr-capture-system)
+  - [Logging Architecture](#logging-architecture)
+  - [Phase Blocking & Notice Refinements](#phase-blocking--notice-refinements-2025-10-15-late-session)
+
+### Cloud Provider Integration
+- [Azure OpenAI Integration (2025-01-09)](#azure-openai-integration-2025-01-09)
+  - [Rate Limit Handling](#rate-limit-handling-2025-01-09)
+  - [Parallel Execution Architecture](#parallel-execution-architecture)
+  - [Checkpoint and Resume System](#checkpoint-and-resume-system)
+  - [Token Limit Safety and Tracking](#token-limit-safety-and-tracking)
+
+### Development & Debugging
+- [Recent Changes & Potential Bug Areas](#recent-changes--potential-bug-areas)
+- [Recent Changes & Bug Fixes (2025-10-15)](#recent-changes--bug-fixes-2025-10-15)
+- [Debugging Guide](#debugging-guide)
+- [Files Reference](#files-reference)
+- [Potential Enhancements](#potential-enhancements)
+
+---
+
 ## Project Overview
 
 Axion Swarm is a multi-agent discussion system using LangGraph where specialized AI agents collaborate through multiple phases to provide comprehensive answers to user questions. Each agent has complete isolation with fresh LLM instances per invocation, seeing only what's explicitly shared in the public discussion.
@@ -2316,6 +2392,67 @@ def get_llm(agent_name: str, agent_config: AgentConfig) -> ChatOllama:
 - **Phase** (noun): One complete cycle where all specialists have the opportunity to contribute. Multiple phases enable iterative refinement of the discussion.
 - **Pass** (verb): To skip contributing by saying "I have no further comments at this time"
 
+**Phase Number Semantics**:
+Phase numbers represent **"transition to resolution"**, not the absolute phase of discussion:
+- **Phase 1-2**: Far from resolution, need fresh perspectives (mandatory contributions)
+- **Phase 3+**: Iteratively moving toward resolution (can pass if no new value)
+- **Final Phase**: At resolution threshold when stagnation detected (mandatory contributions)
+- **User responds after final**: Resets to Phase 3 (user input means not at resolution anymore)
+
+### Phase Reset After User Input (Final Phase Invalidation)
+
+When User provides input during or after the final phase, the system recognizes that resolution has not been reached and resets the discussion to continue iterative refinement.
+
+**Implementation** (`main_tui.py` lines 1110-1162):
+
+```python
+if self.state.get("final_phase_needed") or self.state.get("final_phase_done"):
+    # Step 1: Force Chair to synthesize the entire conversation
+    synthesis_request_msg = SystemMessage(
+        content="Notice: User has provided additional input after final phase. @[Chair], please provide a COMPREHENSIVE SYNTHESIS of the entire conversation so far..."
+    )
+    # Display synthesis request and invoke Chair
+    chair_result = await chair_agent_parallel(self.state)
+    
+    # Step 2: Set compression point to Chair's synthesis
+    self.state["last_compression_message_index"] = len(self.state["messages"]) - 1
+    
+    # Step 3: Reset phase number and clear final phase flags
+    self.state["phase_number"] = 2  # Will be incremented to 3 by start_phase
+    self.state["final_phase_needed"] = False
+    self.state["final_phase_done"] = False
+```
+
+**What Happens**:
+1. **Chair Synthesis**: Chair is invoked to create a comprehensive synthesis of all phases (1 through final)
+2. **History Compression**: `last_compression_message_index` is set to Chair's synthesis message
+3. **Phase Reset**: Phase number resets to 2 (becomes 3 after increment)
+4. **Flag Clearing**: Both `final_phase_needed` and `final_phase_done` cleared
+
+**Result in New Phase 3**:
+Specialists see only:
+- All User messages (always visible)
+- All Notice messages (always visible)
+- Chair's comprehensive synthesis (compression point)
+- New Phase 3+ messages
+
+Everything before the compression point is hidden, preventing specialists from re-reading hundreds of individual specialist messages from Phases 1-11.
+
+**Rationale**:
+- **Phase 3 semantics preserved**: Phase 3 means "iterative refinement toward resolution"
+- **Compression maintains context**: Chair's synthesis captures all key information
+- **Stagnation detection still works**: Phase progression can naturally continue (3→4→5...) and detect stagnation again if needed
+- **Multiple conversation flows supported**: Can have multiple cycles of discussion→final→user input→reset
+
+**Example Flow**:
+```
+User question → Phases 1-11 → Final Phase (stagnation detected)
+User provides new info → Chair synthesizes Phases 1-11 → Reset to Phase 3
+Phases 4-7 → Final Phase (stagnation detected)
+User provides more info → Chair synthesizes entire history → Reset to Phase 3
+Phases 4-5 → Final Phase → Discussion complete
+```
+
 **Universal Rules (All Passes)**:
 - ✅ User messages: **PERMANENT VISIBILITY** (never filtered, always visible like Notice messages)
 - ✅ Notice messages: **PERMANENT VISIBILITY** (never filtered, always visible like User messages)
@@ -3063,9 +3200,60 @@ The Research specialist (and any specialist using search) can determine the curr
 
 The Research specialist has explicit guidance to check timestamps and include year ranges in searches to ensure fact-checking is based on current information.
 
-See `TAVILY_SEARCH_SETUP.md` for detailed setup instructions.
+### Tavily Search Setup
 
-**Documentation**: https://docs.tavily.com
+**What is Tavily?**
+
+Tavily is a search API specifically designed for Large Language Model (LLM) applications. Unlike traditional search APIs, Tavily provides:
+- **LLM-Optimized Results**: Content is structured and formatted specifically for AI agents
+- **Relevance Scoring**: Each result includes a relevance score for the query
+- **Citation-Ready**: Direct URLs to sources for fact-checking
+- **Multi-Source Aggregation**: Aggregates content from 20+ trusted sources per query
+- **Quick Summaries**: Optional LLM-generated answer to the query
+- **Real-Time Data**: Access to current, up-to-date information
+
+Learn more: https://tavily.com | Documentation: https://docs.tavily.com
+
+**Setup Steps:**
+
+1. **Get Your Tavily API Key**
+   - Visit [https://tavily.com](https://tavily.com) and sign up for a free account
+   - Navigate to your dashboard to find your API key
+   - Copy your API key (format: `tvly-prod-xxxxx` for production keys)
+
+2. **Configure Environment Variables**
+   ```bash
+   export TAVILY_API_KEY="tvly-prod-[your-api-key-from-tavily-dashboard]"
+   
+   # Optional: Maximum number of search results per query (default: 5, max: 20)
+   export TAVILY_MAX_RESULTS=5
+   ```
+
+3. **Install Tavily Python SDK**
+   ```bash
+   pip install tavily-python
+   ```
+
+4. **Verify Configuration**
+   - The system will automatically detect your Tavily API key
+   - If configured correctly, specialists can use `@[Search][query]` syntax
+
+**Rate Limits & Pricing:**
+- **Free Tier**: Check Tavily's current free tier limits at https://tavily.com/pricing
+- **Rate Limits**: Tavily provides different rate limits for development and production
+- **API Credits**: Some search modes (like `advanced` search depth) use more credits
+- See: https://docs.tavily.com/documentation/api-reference/credits-pricing
+
+**Security Notes:**
+- Keep your `TAVILY_API_KEY` secure and never commit it to version control
+- Use environment variables or secure secret management systems
+- Rotate your API key if compromised
+- Monitor your API usage through Tavily's dashboard
+
+**Troubleshooting:**
+- `"Tavily Search API not configured"` → Ensure `TAVILY_API_KEY` environment variable is set
+- `"Tavily Python SDK not installed"` → Run `pip install tavily-python`
+- `"Tavily search failed: ..."` → Check error message in stderr for specific details (invalid API key, rate limit exceeded, network connectivity issues, or API service temporarily unavailable)
 
 ---
 
@@ -3405,51 +3593,82 @@ Non-core specialists automatically self-dismiss after responding ONE TIME, keepi
 
 ## Graph Workflow
 
-### Node Structure
+### Node Structure (Current - Parallel Execution)
 ```
-start_phase → context → update_context → research → update_research → ...
-    ↑                                                                    ↓
-    └──────────────────── check_continuation ←───────────────────────────┘
-                                    ↓
-                                  END
+start_phase → execute_phase → check_continuation → [route] →
+    ↑              (parallel)            ↓                    ├─→ save_checkpoint → (back to start_phase)
+    └───────────────────────────────────┘                    └─→ END
 ```
+
+**Flow Explanation**:
+1. **start_phase**: Initialize phase, add Notice message, populate `agents_remaining` with "in" specialists
+2. **execute_phase**: Execute all specialists in parallel (or sequential for Ollama), then Chair synthesizes
+3. **check_continuation**: Decide if continue or end discussion
+4. **Route from check_continuation**:
+   - If `continue_discussion=True`: Go to `save_checkpoint`
+   - If `continue_discussion=False`: Go to `END`
+5. **save_checkpoint**: Save state to disk (JUST BEFORE next phase starts)
+6. Loop back to **start_phase** for next phase
+
+**TUI Blocking**: Between `execute_phase` and `check_continuation`, the TUI checks for pending @[User] questions and blocks until answered.
 
 ### Key Nodes
-- **start_phase**: Initialize phase, add Notice message with phase metadata, reset agents_remaining
-- **{agent}**: Invoke specialist (context, research, engineer, etc.), adds response with phase metadata
-- **update_{agent}**: Remove agent from agents_remaining list
-- **check_continuation**: Decide if continue or trigger final phase or end
-- **save_checkpoint**: Save conversation state to disk, then prompt user to press ENTER before continuing to next phase
+- **start_phase**: Initialize phase, add Notice message with phase metadata, populate `agents_remaining` with "in" specialists
+- **execute_phase**: Execute all specialists in parallel (Azure) or sequential (Ollama), then execute Chair
+  - Non-Chair specialists run in parallel/sequential based on config
+  - Chair always runs AFTER all specialists complete
+  - Returns all messages from the phase (specialists + Chair)
+- **check_continuation**: Decide if `continue_discussion=True/False` based on final phase flags
+- **save_checkpoint**: Save conversation state to disk JUST BEFORE starting next phase
+  - Ensures checkpoint contains clean state (after user answered questions)
+  - If program crashes during Phase N, resume from checkpoint saved before Phase N started
+  - Only runs if continuing (not run on discussion end)
 
 ### User Control
+
+**Simple CLI Mode** (`main.py`):
 After Phase 3+ completes and checkpoint is saved, the system prompts:
 ```
 ⏸️  Press ENTER to continue to next phase (or Ctrl+C to stop):
 ```
-
-**When prompt appears**:
 - **Phase 1-2**: Auto-continues (mandatory assessment phases, no pause)
 - **Phase 3+**: Shows prompt (iterative discussion phases, user can review)
 - **Final Phase**: Auto-continues (conclusion phase, no pause)
 
+**Interactive TUI Mode** (`main_tui.py`):
+Phase transitions are controlled by pending questions:
+- **Questions pending**: System blocks BEFORE next phase starts (at `execute_phase` node completion)
+  - User must answer questions or dismiss them before discussion continues
+  - Notice: "Discussion paused. X question(s) in User To-Do require attention."
+- **No questions, Phase 1-2**: Auto-continues immediately
+- **No questions, Phase 3+**: Shows pause notice (generic "send message to continue")
+- **No questions, Final phase complete**: Shows "Type a message to continue discussion, or /quit to exit"
+- **Graph ends with questions**: Blocks and waits for user (same as mid-discussion)
+
 This gives the user control over:
-- When to proceed during iterative discussion phases (3+)
-- Time to review specialist responses before continuing
-- Ability to stop the discussion cleanly at phase boundaries
-- Checkpoint is already saved, so stopping is safe and resumable
+- Answering specialist questions before moving forward
+- Sending messages at any time to clarify or provide more information
+- Reviewing specialist responses between phases (Phase 3+)
+- Stopping/resuming cleanly (checkpoint saved in clean state)
 
 ### Routing Logic
 ```python
-def route_next_agent(state):
-    remaining = state.get("agents_remaining", [])
-    if not remaining:
-        return "check_continuation"
-    return remaining[0]  # Next agent in order
-
 def route_continuation(state):
-    if state.get("continue_discussion"):
-        return "start_phase"  # Another phase
+    """Route from check_continuation to either save_checkpoint or END."""
+    if state.get("continue_discussion", True):
+        return "start_phase"  # Routes to save_checkpoint node first
     return "__end__"  # Discussion complete
+
+# Graph structure:
+workflow.add_conditional_edges(
+    "check_continuation",
+    route_continuation,
+    {
+        "start_phase": "save_checkpoint",  # Continue: save checkpoint first
+        "__end__": END,  # End: skip checkpoint
+    }
+)
+workflow.add_edge("save_checkpoint", "start_phase")  # After checkpoint, start next phase
 ```
 
 ### Phase Tracking
@@ -3880,6 +4099,148 @@ This dual-mode capability means the same codebase can run efficiently on local h
 ## Recent Changes & Potential Bug Areas
 
 ### Recent Changes (Session Summary)
+
+**2025-10-15 (Part 2): TUI Double Phase Start + Message Order Fix**
+
+**Context**: After the initial fixes, discovered three more issues:
+1. Phase 2 starting twice when answering the last question via Reply
+2. Old graph tasks becoming zombies (running forever in background)
+3. "Starting Phase 2" notice appearing BEFORE user's final message
+
+**Root Causes**:
+
+1. **Double Phase Start Bug** (`main_tui.py` lines 1350-1385):
+   - **Problem**: In reply context, both unblocking old graph AND starting new graph
+   - **Flow**: 
+     ```
+     remove_mention_by_index (reply) → unblocks old graph + flags new graph
+     inject_user_message → sees flag → starts new graph
+     Result: TWO graphs running Phase 2 simultaneously!
+     ```
+   - **Fix**: Cancel old graph task explicitly before starting new one
+     ```python
+     # Cancel old graph cleanly
+     if self.graph_task and not self.graph_task.done():
+         self.graph_task.cancel()
+         await self.graph_task  # Wait for cleanup
+     # Then start fresh graph
+     self.graph_task = asyncio.create_task(self.run_graph())
+     ```
+
+2. **Zombie Task Bug**:
+   - **Problem**: Old graph task left blocked at `while self.waiting_for_input: await asyncio.sleep(0.1)` forever
+   - **Impact**: Wasted CPU cycles, memory leak from undead tasks
+   - **Fix**: Explicitly cancel task before replacing (proper asyncio cleanup pattern)
+
+3. **Message Order Bug** (`main_tui.py` lines 484-507, 1352-1373):
+   - **Problem**: In reply context, `remove_mention_by_index` added "Starting Phase 2" notice BEFORE user message
+   - **Incorrect flow**:
+     ```
+     1. remove_mention_by_index → adds "Starting Phase 2" notice
+     2. inject_user_message → adds user message AFTER notice
+     Result: Notice appears before user spoke!
+     ```
+   - **Fix**: Split notice creation by context
+     - **Direct dismiss**: Add notice in `remove_mention_by_index` (no user message involved)
+     - **Reply context**: Add notice in `inject_user_message` AFTER user message
+   - **Correct flow** (reply):
+     ```
+     1. inject_user_message → adds user message
+     2. inject_user_message (need_graph_restart path) → adds "Starting Phase 2" notice
+     Result: User speaks first, then system responds ✓
+     ```
+
+4. **Ctrl+D Keybinding Not Working From All Panes** (`main_tui.py` lines 388-389, 790-793):
+   - **Problem**: Ctrl+C/Ctrl+D didn't work when Input or other widgets had focus
+   - **Cause**: Child widgets were capturing keystrokes before app-level bindings could handle them
+   - **Fix**: Used `Binding(..., priority=True)` for Ctrl+C/Ctrl+D to give them precedence over all child widgets
+   - **Also**: Added `on_key()` handler as backup to intercept these keys at app level
+   - **Result**: Both keybindings work consistently regardless of which pane has focus
+
+5. **Duplicate UNBLOCKED Message** (`main_tui.py` lines 479-484):
+   - **Problem**: Two "System state: UNBLOCKED" debug messages - one before final user message, one after
+   - **Cause**: Debug message shown unconditionally in `remove_mention_by_index` for both contexts
+   - **Fix**: Only show debug message for direct dismiss context (moved into `if auto_restart` block)
+   - **Result**: Reply context shows debug message only in `inject_user_message` after user message
+
+**Path-Specific Behavior**:
+
+**Direct Dismiss** (click "Remove from To-Do"):
+- No user message to add
+- Add notice in `remove_mention_by_index`
+- Unblock old graph, let it continue naturally (efficient)
+
+**Reply Context** (click "Reply" then send message):
+- User message must be added first
+- `remove_mention_by_index` only flags `need_graph_restart`
+- `inject_user_message` adds user message, THEN notice, THEN cancels old graph + starts new
+
+**Files Modified**:
+- `main_tui.py`: Fixed graph cancellation (lines 1375-1382), split notice creation by context (lines 484-507, 1357-1373), added key handler (lines 787-793)
+
+**Benefits**:
+- No double phase starts (only one graph runs)
+- No zombie tasks (proper cleanup)
+- Correct message ordering (user speaks before system notice)
+- Consistent keybindings (Ctrl+C/Ctrl+D always work)
+
+**2025-10-15 (Part 1): TUI Message Display Fix + Question Blocking + Checkpoint Timing**
+
+**Context**: Three issues discovered in TUI mode:
+1. Only first specialist message (Ethicist) displayed in Phase 1, despite all specialists responding
+2. Phase 2 started immediately even though specialists asked questions in Phase 1
+3. Checkpoint timing was suboptimal (saved before user answered questions)
+
+**Root Causes**:
+
+1. **Message Display Bug** (`main_tui.py` lines 827-863):
+   - **Problem**: Streaming code was doing `self.state = {**self.state, **node_output}` which **replaced** the entire messages list with only new messages from that node
+   - **Impact**: Each node's output overwrote previous messages, so only the last message appeared
+   - **Fix**: Changed to properly **append** new messages to existing messages (matching LangGraph's `add_messages` reducer):
+     ```python
+     # OLD (broken):
+     self.state = {**self.state, **node_output}  # Replaces messages!
+     
+     # NEW (fixed):
+     existing_messages = self.state.get("messages", [])
+     new_state["messages"] = existing_messages + node_output["messages"]  # Appends messages
+     ```
+
+2. **Question Blocking Timing** (`main_tui.py` lines 865-891):
+   - **Problem**: Question check happened at `save_checkpoint` node, which was TOO LATE
+   - **Flow**: `start_phase` → `execute_phase` → `check_continuation` → `save_checkpoint` (check here) → Phase 2 already starting!
+   - **Fix**: Moved check to immediately after `execute_phase` completes (BEFORE next node starts)
+   - **Impact**: Now blocks Phase 2 from starting until user answers Phase 1 questions
+
+3. **Checkpoint Timing** (`axion_swarm/graph.py` lines 110-123):
+   - **Problem**: Checkpoint saved after `check_continuation` but before deciding to continue
+   - **Fix**: Reordered graph flow to save checkpoint JUST BEFORE starting next phase:
+     ```python
+     # OLD:
+     execute_phase → check_continuation → save_checkpoint → [route] → start_phase or END
+     
+     # NEW:
+     execute_phase → check_continuation → [route] → 
+       ├─ if continue: save_checkpoint → start_phase
+       └─ if end: END (no checkpoint)
+     ```
+   - **Benefit**: Checkpoint now saved after user answers questions, in clean state ready for next phase
+
+**Graph Flow Updates** (`axion_swarm/graph.py`):
+- Changed routing from `save_checkpoint` node to `check_continuation` node
+- `check_continuation` now routes to either `save_checkpoint` (if continuing) or `END` (if stopping)
+- `save_checkpoint` always leads to `start_phase` (next phase)
+- Updated docstring to clarify checkpoint timing: "JUST BEFORE starting the next phase"
+
+**Benefits**:
+- All specialist messages now display correctly in TUI
+- Questions block phase transitions immediately (at the right time)
+- Checkpoints saved in clean state (after questions answered, before next phase starts)
+- Resume from crash is cleaner (Phase N checkpoint = ready to start Phase N)
+
+**Files Modified**:
+- `main_tui.py`: Fixed message merging (lines 838-850), moved question check (lines 865-891)
+- `axion_swarm/graph.py`: Reordered checkpoint flow (lines 110-123), updated docstring (lines 53-66)
 
 **2025-10-12: Fixed Colorization Regex - Handles Nested Quotes in XML Attributes**
 
@@ -6582,3 +6943,1276 @@ Rate limits are often a symptom of large context windows. By using rate limit ev
 
 However, the trade-off between context compression and conversational coherence needs careful consideration. This feature should be **optional and configurable**, allowing users to enable it when running into rate limit issues frequently, or disable it when conversational continuity is more important than context size.
 
+---
+
+## Interactive TUI Mode (2025-10-14)
+
+### Overview
+
+Axion Swarm supports two user interfaces:
+
+1. **Simple CLI** (`main.py`) - Original implementation, single prompt at start
+2. **Interactive TUI** (`main_tui.py`) - Textual-based chat interface with ongoing User participation
+
+The interactive TUI enables Users to send messages at any point during the discussion, not just at initialization. This supports the full collaborative pattern described in [Project Overview](#project-overview) where Users can respond at any phase, provide clarifications, or invalidate Final Phase proposals.
+
+### Architecture Separation
+
+The TUI is implemented as a **separate wrapper** around the core system with zero modifications to the graph execution logic. Both interfaces use the same `create_swarm_graph()`, `agents.py`, `prompts.py`, and state management.
+
+### Key Features
+
+**1. Real-Time Message Injection**
+- Users can type messages at any point in the discussion
+- Messages are injected as `HumanMessage` with proper metadata (timestamp, phase)
+- Discussion continues with User input in context
+
+**2. Final Phase Invalidation with Notice**
+- When User speaks during/before Final Phase, system adds:
+  - User's message to conversation history
+  - Notice message: "User has provided additional input. Final phase has been invalidated. Continuing discussion as Phase N (normal discussion mode with full context)."
+- All specialists see both messages in their context for next phase
+- Ensures transparent communication of context changes
+
+**3. User Engagement in Stagnation Detection** (Interactive Mode Only)
+- User engagement signals are **conditional** on `interactive_mode` flag
+- Simple CLI mode: Signals disabled (User only provides initial goal)
+- Interactive TUI mode: Signals enabled (User can participate throughout)
+  - Recent User response: -30% stagnation (this phase), -15% (last phase)
+  - High User engagement: -20% stagnation (3+ messages)
+- Active User participation delays Final Phase appropriately in interactive mode
+
+**4. Command System**
+- `/continue` - Manually proceed to next phase (optional; system auto-resumes when "?" to-dos cleared)
+- `/status` - Show current phase and specialists in room
+- `/help` - Show available commands
+- `/quit` - Exit discussion gracefully
+
+**5. Discussion Restart After Conclusion**
+- If discussion reaches conclusion (Final Phase completes), User can still send messages
+- Graph automatically restarts with updated state
+- Full context preserved across restart boundary
+- Enables true "continuous collaboration" pattern
+
+### User Engagement Flow
+
+```
+Phase 1-N: Discussion progresses
+Phase N: Stagnation detected, Final Phase proposed
+Phase N+1 (Final): Specialists give final thoughts
+
+[Discussion concludes, graph ends]
+
+User returns and types message:
+  → User message added to history
+  → Notice added: "Final phase invalidated..."
+  → Graph restarts
+  
+Phase N+2: Specialists see User message + Notice
+           Continue discussion with full awareness
+```
+
+### Final Phase Invalidation Details
+
+**Final Phase is NOT truly final** - it's a **proposed conclusion** that User can override by speaking.
+
+The system detects stagnation (lack of new information, specialists passing, etc.) and proposes to wrap up. But User engagement changes everything:
+- User might have been away, now returns with clarifications
+- User might disagree with Chair's synthesis
+- User might want to explore a tangent
+- User might have new requirements
+
+**The Final Phase proposal can be invalidated at any time by User participation.**
+
+#### Three States of Finality
+
+**State 1: Final Phase Proposed (Not Executed)**
+```python
+final_phase_needed = True
+final_phase_done = False
+continue_discussion = True
+```
+
+What happens:
+- Stagnation detected → Chair announces "triggering final round"
+- Next phase will be Final Phase
+- Specialists will see "this is the final phase" in system prompt
+
+If User speaks:
+- Add User message to conversation
+- Add Notice message: "User has provided additional input. Final phase has been invalidated. Continuing discussion as Phase N+1 (normal discussion mode with full context)."
+- Set `final_phase_needed = False`
+- Continue in Phase N+1 (normal Phase 3+ mode)
+- Final Phase never happens
+- All specialists see the Notice in their context for next phase
+- Stagnation detection re-evaluates with User engagement
+
+**State 2: Final Phase Executing**
+```python
+final_phase_needed = True
+final_phase_done = False
+continue_discussion = True
+phase_number = N (currently in Final Phase)
+```
+
+What happens:
+- Specialists give final thoughts (seeing "final phase" prompt)
+- Chair gives synthesis
+- Each specialist message arrives in real-time
+
+If User speaks during execution:
+- User message added to conversation
+- Notice message added: "User has provided additional input. Final phase has been invalidated. Continuing discussion as Phase N+1 (normal discussion mode with full context)."
+- Set `final_phase_needed = False` and `final_phase_done = False`
+- Current phase completes normally
+- Next phase becomes Phase N+1 (normal mode)
+- All specialists see User message + Notice in next phase
+- Discussion continues with full awareness of context change
+
+**State 3: Final Phase Completed**
+```python
+final_phase_needed = True  (cleared by check_continuation)
+final_phase_done = True
+continue_discussion = False
+```
+
+What happens:
+- Final Phase finished
+- `check_continuation` sees `final_phase_done = True`
+- Returns `continue_discussion = False`
+- Graph ends
+- TUI shows "Discussion reached conclusion!"
+
+If User speaks after completion:
+- TUI detects `discussion_ended = True`
+- User message added to conversation
+- Notice message added: "User has provided additional input. Final phase has been invalidated. Continuing discussion as Phase N+1 (normal discussion mode with full context)."
+- Set `continue_discussion = True`
+- Set `final_phase_needed = False` and `final_phase_done = False`
+- **Restart graph** with updated state
+- Discussion continues from where it left off
+- All specialists see User message + Notice explaining context change
+
+#### Implementation: TUI Message Injection (`main_tui.py` lines 240-269)
+
+```python
+# Check if we need to invalidate final phase and add Notice
+if self.state.get("final_phase_needed") or self.state.get("final_phase_done"):
+    # Add Notice message to conversation history so specialists see it
+    next_phase = current_phase + 1
+    notice_msg = SystemMessage(
+        content=f"Notice: User has provided additional input. Final phase has been invalidated. Continuing discussion as Phase {next_phase} (normal discussion mode with full context).",
+        name="Notice",
+        additional_kwargs={
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+            "phase": current_phase
+        }
+    )
+    self.state["messages"].append(notice_msg)
+    await self.display_message(notice_msg)
+    
+    # Clear final phase flags
+    self.state["final_phase_needed"] = False
+    self.state["final_phase_done"] = False
+
+# If discussion ended, restart it
+if self.discussion_ended:
+    self.discussion_ended = False
+    self.state["continue_discussion"] = True
+    # Restart graph with updated state (includes User message + Notice)
+    self.graph_task = asyncio.create_task(self.run_graph())
+```
+
+#### Example: User Invalidates Final Phase After Conclusion
+
+```
+Phase 1-2: Initial discussion
+Phase 3-5: Iterative refinement
+Phase 6: Stagnation detected (specialists passing, no new info)
+        Chair: "Triggering final round"
+        final_phase_needed = True
+
+Phase 7 (Final Phase):
+        Chair: "In conclusion, here's my synthesis..."
+        final_phase_done = True
+        continue_discussion = False
+        
+[Graph ends]
+
+TUI: "✅ Discussion reached conclusion!"
+     "Type a message to continue discussion, or /quit to exit"
+
+[User sits and thinks for 2 minutes...]
+
+User types: "Wait, what about the security implications?"
+
+[System adds to conversation history:]
+User: "Wait, what about the security implications?"
+Notice: User has provided additional input. Final phase has been invalidated. 
+        Continuing discussion as Phase 8 (normal discussion mode with full context).
+
+TUI: ▶️  Restarting discussion with your input...
+     
+Phase 8 (New normal phase, specialists see User message + Notice in context):
+        Context specialist: "Addressing security implications raised by User..."
+        Research specialist: @[Search][security implications]
+        Skeptic specialist: "Good point - I should have raised this in final phase..."
+        ...
+
+[Discussion continues naturally]
+```
+
+#### What Specialists See After Invalidation
+
+When Phase 8 starts, specialists see in their context:
+
+```
+[... previous phases truncated ...]
+
+Phase 7 messages:
+<message><from>Chair</from>...<content>Final Synthesis: Based on our comprehensive discussion...</content></message>
+
+Phase 7 User input:
+<message><from>User</from>...<content>Wait, what about the security implications?</content></message>
+
+Phase 7 Notice:
+<message><from>Notice</from>...<content>Notice: User has provided additional input. Final phase has been invalidated. Continuing discussion as Phase 8 (normal discussion mode with full context).</content></message>
+
+Now entering Phase 8 (normal discussion mode):
+[Your turn to respond]
+```
+
+**Key transparency benefits:**
+1. User's message with the new concern
+2. Notice explaining Final Phase was invalidated
+3. Confirmation they're in normal discussion mode (Phase 8)
+4. Full conversation history maintained
+5. No confusion about expectations
+
+### Interactive Mode Flag Behavior
+
+User engagement signals in stagnation detection are **conditional** on the `interactive_mode` flag to ensure semantic correctness across both UI modes.
+
+#### The Problem
+
+User engagement signals should only be active when User **can** participate during the discussion:
+- **Simple CLI mode** (`main.py`): User only provides goal once at start, cannot send messages during discussion
+- **Interactive TUI mode** (`main_tui.py`): User can send messages at any phase
+
+Applying User engagement signals in simple CLI mode would be meaningless (and misleading).
+
+#### The Solution
+
+Introduced `interactive_mode` boolean flag in state:
+
+```python
+# state.py
+interactive_mode: bool  # True if running in interactive TUI mode
+```
+
+**Purpose:** Controls whether User engagement signals are applied in stagnation detection.
+
+#### Stagnation Detection Logic
+
+Made signals conditional (`agents.py` lines 1980-2014):
+
+```python
+# Check mode first
+interactive_mode = state.get("interactive_mode", False)
+
+# Only apply signals if in interactive mode
+if interactive_mode and user_silence_phases == 0:
+    recent_user_score = -0.30  # Recent response
+    ...
+
+if interactive_mode and user_message_count >= 3:
+    engagement_justification = -0.20  # High engagement
+    ...
+```
+
+#### Behavior by Mode
+
+**Simple CLI Mode** (`main.py`, sets `interactive_mode=False`):
+
+User Pattern:
+- User provides discussion topic at start
+- System runs autonomous multi-phase discussion
+- User cannot send messages during discussion
+- Final output displayed when complete
+
+Stagnation Detection:
+- User engagement signals **DISABLED**
+- Debug output shows: "DISABLED (simple CLI mode - user only provides initial goal)"
+- Stagnation based purely on: specialist activity, conditional language, research, answer mode
+
+**Interactive TUI Mode** (`main_tui.py`, sets `interactive_mode=True`):
+
+User Pattern:
+- User provides discussion topic at start
+- System runs multi-phase discussion
+- User **can** send messages at any phase
+- User can invalidate Final Phase by speaking
+- Discussion can restart after conclusion
+
+Stagnation Detection:
+- User engagement signals **ENABLED**
+- Recent User response: -30% (this phase), -15% (last phase)
+- High User engagement: -20% (3+ messages)
+- Debug output shows active signal computations
+
+#### Benefits
+
+**Correct Stagnation Behavior:**
+- Simple CLI: Doesn't penalize for "User silence" (User was never expected to speak)
+- Interactive TUI: Correctly delays Final Phase when User is active
+
+**Mode Transparency:**
+Debug output clearly shows which mode is active with explicit DISABLED/ENABLED status.
+
+**Clean Separation:**
+Mode detection is explicit via boolean flag, not inferred from ambiguous signals like User message count.
+
+**Backward Compatible:**
+Default value `state.get("interactive_mode", False)` ensures safe, conservative behavior for existing checkpoints.
+
+### User Guide Reference
+
+For practical user-facing instructions on using the interactive TUI, see **[TUI_USAGE.md](TUI_USAGE.md)** - covers commands, troubleshooting, and example sessions.
+
+### Core Changes
+
+While the TUI is separate, two core changes were made to support interactive mode:
+
+**1. User Engagement Signals Made Conditional** (`agents.py` lines 1980-2014)
+- Checks `state.get("interactive_mode", False)` before applying signals
+- Simple CLI mode (`interactive_mode=False`): Signals disabled
+- Interactive TUI mode (`interactive_mode=True`): Signals enabled
+  - Recent User response: -30% stagnation (this phase), -15% (last phase)
+  - High User engagement: -20% stagnation (3+ messages)
+- Reduces stagnation probability when User is actively participating (interactive mode only)
+- Debug output shows mode-aware status (lines 2168-2192)
+
+**2. State Schema Extended** (`state.py` lines 20-21)
+- Added `checkpoint_saved_this_phase: bool` field
+  - Supports checkpoint optimization (skip redundant saves)
+  - Used by both simple and interactive modes
+- Added `interactive_mode: bool` field
+  - Set to `False` in `main.py` (simple CLI)
+  - Set to `True` in `main_tui.py` (interactive TUI)
+  - Controls User engagement signal behavior in stagnation detection
+
+### Dependencies
+
+Interactive TUI requires additional dependency:
+
+```toml
+"textual>=0.47.0"  # Terminal UI framework
+```
+
+Simple CLI mode has no additional dependencies.
+
+### Usage
+
+```bash
+# Simple CLI (original)
+python main.py
+
+# Interactive TUI (new)
+python main_tui.py
+```
+
+Both modes support checkpoint/resume and all core features (search, room management, stagnation detection, etc.).
+
+### Design Philosophy
+
+The interactive TUI embodies the architectural principle described in [The Fundamental Model](#the-fundamental-model-internal-expert-team-with-async-collaboration):
+
+> The system fully supports ongoing User participation—Users can respond at any phase, clarify requirements, answer specialist questions, or provide additional context. The async pattern is the expected default, but synchronous collaboration is fully supported when User is available.
+
+The TUI makes this bidirectional collaboration seamless: specialists work autonomously while User is away (async), but User can jump in at any moment (sync), and the system adapts naturally to both patterns.
+
+### Testing Scenarios
+
+When testing interactive mode, verify:
+
+- [ ] User can send messages during any phase (1, 2, 3+, Final)
+- [ ] Final Phase invalidation triggers Notice message
+- [ ] Notice message appears in specialist context (next phase)
+- [ ] Stagnation detection responds to User engagement (check debug output)
+- [ ] Discussion can restart after conclusion (graph ends, User speaks, restarts)
+- [ ] Commands work (`/continue`, `/status`, `/help`, `/quit`)
+- [ ] Automatic blocking: "?" to-dos pause discussion immediately with Notice
+- [ ] Automatic unblocking: clearing last "?" to-do resumes discussion automatically with Notice
+- [ ] Checkpoint/resume works across interactive sessions
+- [ ] Both simple and interactive modes coexist without conflicts
+
+### Recent Refinements (2025-10-14 Evening Session)
+
+This section documents critical bug fixes, UX improvements, and architectural refinements made after the initial TUI implementation.
+
+#### 1. Critical Exception Handling
+
+**Problem:** When exceptions occurred in the TUI, errors were displayed inside the TUI window where text selection is difficult, forcing users to screenshot instead of copy/paste for debugging.
+
+**Solution:** Implemented `_handle_fatal_exception()` method (`main_tui.py` lines 856-875):
+- Logs exception to file
+- Prints full stack trace to original stderr (console)
+- Exits TUI with return code 1
+- Wrapped `on_mount()` and `run_graph()` with exception handlers
+
+**Result:** Any exception now exits the TUI cleanly and prints a copyable stack trace:
+```
+================================================================================
+❌ FATAL EXCEPTION in run_graph - Exiting TUI
+================================================================================
+Error: [error message]
+
+[full stack trace]
+================================================================================
+```
+
+#### 2. Immediate "Thinking" Notice Display
+
+**Problem:** Users couldn't tell if the system was working or hung between phase transitions, especially after clearing questions.
+
+**Architecture Change:** The "specialists are thinking 🧠" notice is now generated in TWO places for immediate visibility:
+
+**A. Normal Phase Start** (`agents.py` lines 3348-3399):
+- `start_phase` node adds thinking notice to `messages_to_add`
+- Notice includes all active specialists formatted as @[Name] for colorization
+- Adds newline after notice for visual separation
+- LangGraph displays immediately when node completes (before parallel processing)
+
+**B. Auto-Resume After Question Dismissal** (`main_tui.py` lines 499-580):
+- When last "?" item is dismissed, TUI immediately:
+  1. Adds "All questions cleared, proceeding to Phase X" notice
+  2. Adds "[Specialists] are thinking 🧠" notice
+  3. Displays BOTH synchronously via `messages_log.write()`
+  4. Sets `waiting_for_input = False` to resume graph
+- Uses **synchronous** display (not async `run_worker`) to guarantee notices appear before graph resumes
+
+**Deduplication Logic** (`agents.py` lines 3355-3381):
+- `start_phase` checks if last message is already a thinking notice for this phase
+- If duplicate detected (from TUI auto-resume), skips adding another
+- Prevents double notices when user dismisses questions
+
+**Result:** Users see immediate feedback that specialists are processing, eliminating perception of hangs.
+
+#### 3. Oxford Comma Formatting
+
+**Enhancement:** Specialist lists now use proper English grammar with Oxford comma.
+
+**Implementation:** Added `format_name_list()` helper function to both files:
+- `main_tui.py` lines 39-54
+- `agents.py` lines 562-577
+
+**Examples:**
+- 1 name: "Context specialist"
+- 2 names: "Context specialist and Research specialist"
+- 3+ names: "Context specialist, Research specialist, and Skeptic specialist"
+
+**Applied to:** Thinking notices, specialist roster announcements
+
+#### 4. User To-Do List Architecture
+
+**Design Philosophy:** Each message mentioning @[User] creates ONE sidebar item:
+- **"?" item** (❓) if message contains ANY '?' after @[User]
+- **"!" item** (❗) if message contains NO '?' after @[User]
+
+**Rationale:** 
+- If specialist addresses @[User], any questions following are implicitly directed at them
+- Communication pattern: context → @[User] mention → questions
+- Clear structure makes question target unambiguous
+
+**Question Detection & Duplicate Prevention** (`main_tui.py` lines 665-698):
+```python
+def add_user_mention(self, speaker: str, content: str, timestamp_str: str, formatted_full: str, message_index: int):
+    # Check if message contains @[User]
+    if '@[User]' not in content:
+        return
+    
+    # Prevent duplicates: check if this message_index already added
+    if any(m['message_index'] == message_index for m in self.user_mentions):
+        return
+    
+    # Find position of @[User]
+    user_mention_pos = content.find('@[User]')
+    
+    # Check if there's ANY '?' AFTER @[User]
+    text_after_user = content[user_mention_pos:]
+    has_question_mark = '?' in text_after_user
+    
+    # Add ONE to-do item per message (not per sentence)
+    self.user_mentions.append({
+        'speaker': speaker,
+        'content': content,  # Full message content
+        'message_index': message_index,
+        'is_question': has_question_mark
+    })
+```
+
+**Duplicate Prevention (Two Layers):**
+1. **Message Display Level** (lines 836-842): Track `displayed_message_count` to only display new messages when graph restarts
+2. **To-Do List Level** (lines 671-674): Check `message_index` before adding to prevent duplicate to-do items
+
+**Modal Behavior:**
+- **"?" items**: Show "Reply and Dismiss" button (auto-dismisses on reply) + "Remove from To-Do" button
+- **"!" items**: Show "Acknowledge / Dismiss" button only
+
+**Phase Progression Rules:**
+- "?" items (questions) **block** progression to next phase
+- "!" items (notices) do **NOT** block progression
+- **Phase Boundary Blocking**: System checks for "?" items at the END of each phase (after all specialists finish)
+  - All specialists in current phase complete their messages first
+  - Questions added to to-do list as messages arrive (non-blocking)
+  - At phase boundary (save_checkpoint): if questions exist → show Notice and pause
+  - Prevents moving to next phase until all questions cleared
+- **Automatic Unblocking**: When last "?" item is cleared (dismissed or replied to):
+  1. System immediately shows Notice: "Discussion resuming. All questions addressed. Starting Phase X."
+  2. Graph automatically restarts to continue to next phase
+  3. No manual `/continue` or message sending required
+
+**Notice Messages:**
+- **Blocking Notice** (when questions detected):
+  ```
+  📢 Notice: Discussion paused. X question(s) in User To-Do require attention. Address questions to continue.
+  ```
+- **Unblocking Notice** (when all questions cleared):
+  ```
+  📢 Notice: Discussion resuming. All questions addressed. Starting Phase X.
+  ```
+- **No Repeated Notices**: System shows blocking notice ONCE when first question appears, then silence until all cleared
+  - Dismissing/replying to questions while others remain → no notice (silent)
+  - Only unblocking notice when last question cleared
+- Both notices appear immediately in conversation and in `discussion.log`
+
+**Implementation** (`main_tui.py`):
+- Lines 665-698: Add user mention (one per message, with duplicate prevention)
+- Lines 827-863: Message streaming with proper `add_messages` semantics (append, not replace)
+- Lines 865-891: Phase boundary blocking check (immediately after `execute_phase` node, BEFORE next phase)
+- Lines 451-507: Remove mention with split notice creation (direct dismiss vs reply context)
+- Lines 1350-1385: Deferred graph restart with old task cancellation (reply context)
+- Lines 889-920: Graph end handling (check questions, only show "Type a message" if final phase complete with no questions)
+- Lines 787-793: App-level key handler for consistent Ctrl+C/Ctrl+D quit binding
+
+#### 5. Specialist Mention Colorization in Notices
+
+**Enhancement:** Notices now display specialist names with colorization matching conversation messages.
+
+**Implementation** (`main_tui.py` lines 554-574, `agents.py` lines 3385-3388):
+- Format specialist names as `@[Context specialist]`, `@[Research specialist]`, etc.
+- Apply `highlight_mentions()` to colorize based on specialist presence:
+  - **Light purple (bright_magenta)**: Specialists "in" the room
+  - **Light red (bright_red)**: Specialists "available" but not in room
+- Uses `format_name_list()` for proper grammar with Oxford comma
+
+**Before:**
+```
+Notice: Context specialist, Research specialist are thinking... 🧠
+```
+
+**After (with colors):**
+```
+Notice: @[Context specialist], @[Research specialist], and @[Skeptic specialist] are thinking... 🧠
+       [light purple]           [light purple]                  [light purple]
+```
+
+#### 6. Visual Spacing Refinements
+
+**Enhancement:** Added newlines for better readability:
+- Blank line between "proceeding" and "thinking" notices (`main_tui.py` line 548)
+- Newline after thinking notice before first specialist response (`agents.py` line 3392, `main_tui.py` line 561)
+
+**Result:** Clear visual separation between system notices and specialist responses.
+
+#### 7. UI Polish
+
+**F2 Button Text** (`main_tui.py` line 414):
+- Changed from "Toggle @User" to "Toggle User To-do"
+- More accurately describes sidebar content
+
+**Input Field Border** (`main_tui.py` lines 399-408):
+- Added `#input-container` with `padding-bottom: 1`
+- Ensures bottom border is visible (not cut off by screen edge)
+- Maintains aesthetic consistency with other UI elements
+
+#### 8. System Debug Messages
+
+**Bug Fix:** Checkpoint save messages were printing to stdout instead of stderr.
+
+**Fix** (`checkpoint.py` line 193):
+```python
+# Before
+print(f"💾 Checkpoint saved...", flush=True)
+
+# After  
+print(f"💾 Checkpoint saved...", file=sys.stderr, flush=True)
+```
+
+**Result:** System messages (💾, ✅, 🗑️, etc.) now correctly display with gear emoji ⚙️ prefix in TUI via `StderrCapture`.
+
+#### 9. Display Refresh Sequencing
+
+**Problem:** Auto-resume notices weren't always visible before graph resumed, making it appear the system progressed without notifying the user.
+
+**Root Cause:** Textual's render cycle wasn't completing before `waiting_for_input = False` allowed graph to continue.
+
+**Solution** (`main_tui.py` lines 541-589):
+```python
+# 1. Write notices synchronously
+messages_log.write(notice_formatted)
+messages_log.refresh()  # Force immediate render
+
+messages_log.write("")  # Blank line
+messages_log.refresh()
+
+messages_log.write(thinking_formatted)
+messages_log.refresh()
+
+# 2. Use call_after_refresh to defer resume
+def resume_after_refresh():
+    self.waiting_for_input = False
+    logger.info(f"[AUTO-RESUME] resuming...")
+
+self.call_after_refresh(resume_after_refresh)
+```
+
+**Key Insight:** `refresh()` forces immediate render, and `call_after_refresh()` ensures Textual's render cycle completes before setting the flag that allows graph to continue.
+
+**Result:** Notices are always visible before graph resumes, eliminating perception of "silent" progression.
+
+#### 10. Modal Dismiss Sequencing
+
+**Problem:** When dismissing questions via modal "Remove from To-do" button, notices wouldn't appear.
+
+**Root Cause:** Modal dismissing immediately after `remove_mention_by_index()` was called, potentially clearing screen before notices rendered.
+
+**Solution** (`main_tui.py` lines 344-349):
+```python
+elif event.button.id == "remove-btn":
+    # Dismiss modal first, then remove mention after refresh
+    mention_idx = self.mention_index
+    self.dismiss()
+    self.app_ref.call_after_refresh(lambda: self.on_remove_callback(mention_idx))
+```
+
+**Flow:**
+1. Modal dismisses immediately
+2. After modal fully closes (`call_after_refresh`), `remove_mention_by_index()` is called
+3. If all questions cleared, auto-resume notices display properly
+
+**Result:** Consistent notice display whether dismissing via modal or input field.
+
+#### 11. Modal Button Text Refinements
+
+**Enhancement:** Clarified button labels for better UX.
+
+**Changes** (`main_tui.py` line 313):
+- **"?" items**: "Remove from To-do (or acknowledge)" - clarifies that removal is also acknowledgment
+- **"!" items**: "Acknowledge / Dismiss" - emphasizes informational nature
+
+**Result:** Users understand that dismissing a question acknowledges they've read it.
+
+#### 12. Auto-Resume Notice Sequencing
+
+**Problem:** When replying to a question via "Reply and Dismiss" button, the auto-resume notices ("proceeding to next phase" and "specialists thinking") wouldn't appear, even though the phase progressed.
+
+**Root Cause:** `inject_user_message` was clearing `waiting_for_input = False` immediately (line 1494), causing the graph to resume before `remove_mention_by_index` could display its notices.
+
+**Solution** (`main_tui.py` lines 1492-1500):
+```python
+elif self.waiting_for_input:
+    question_count = sum(1 for m in self.user_mentions if m.get('is_question', False))
+    if question_count > 0:
+        # Still have questions, but user sent additional input - continue discussion
+        self.waiting_for_input = False
+        logger.info("Continuing discussion with user input (questions still remain)")
+    # else: all questions cleared - remove_mention_by_index will handle resume with notices
+```
+
+**Key Insight:** Only clear `waiting_for_input` in `inject_user_message` if questions remain. If all questions are cleared, let `remove_mention_by_index` handle the resume with proper notice sequencing (via `call_after_refresh`).
+
+**Result:** Auto-resume notices always appear when last question is cleared, regardless of how it's dismissed.
+
+#### 13. Statistics Collection After Phase 1
+
+**Problem:** Auto-collapse required 10 messages before activating, causing long Search tool responses in Phase 1 to not be collapsed.
+
+**Root Cause:** Statistics were being collected from message #1, but 10+ messages might not occur until Phase 2+.
+
+**Solution** (`main_tui.py` lines 1006-1009):
+```python
+# Enable statistics collection after Phase 1 completes
+if phase >= 1 and not self.stats_collection_enabled:
+    self.stats_collection_enabled = True
+    logger.info(f"[STATS] Enabled message statistics collection after Phase {phase}")
+```
+
+**Updated `should_collapse_message`** (lines 616-655):
+- Check `stats_collection_enabled` first, return `False` if not enabled
+- Only collect statistics for messages AFTER Phase 1 completes
+- Still require 10 messages after Phase 1 to establish baseline
+
+**Rationale:** Phase 1 has specialist tool use (Search, ReadURL) which naturally produces longer messages. By waiting until Phase 2+, we establish a more realistic baseline of "normal" message lengths, making outliers more detectable.
+
+**Result:** Auto-collapse activates sooner in the conversation (Phase 2+) with a better-calibrated baseline.
+
+---
+
+### Complete Code Reference
+
+For detailed code snippets, implementation patterns, and testing checklist for all TUI refinements, see:
+- **[TUI_REFINEMENTS_CODE_SUMMARY.md](TUI_REFINEMENTS_CODE_SUMMARY.md)** - 469-line comprehensive code reference
+
+This document includes:
+- All code changes with exact line numbers
+- Architectural patterns (synchronous display, modal sequencing, etc.)
+- Helper function implementations
+- Testing checklist
+
+#### Architecture Impact
+
+These refinements maintain the core principle: **TUI is a separate wrapper with zero modifications to graph execution logic**. Changes are minimal and localized:
+
+**Core System Changes:**
+- `agents.py`: Moved thinking notice from `execute_phase_parallel` to `start_phase` (improves timing)
+- `agents.py`: Added deduplication logic for thinking notices
+- `agents.py`: Added `format_name_list()` helper
+- `checkpoint.py`: Fixed print statement to use stderr (1 line change)
+
+**TUI-Specific Enhancements:**
+- `main_tui.py`: All UI polish, question detection, auto-resume logic, exception handling
+
+### TUI Logging to discussion.log
+
+**Purpose**: The TUI logs everything to `discussion.log` with Rich markup for colorized viewing.
+
+**What Gets Logged:**
+1. All transcript messages - Every speaker, every message with timestamps
+2. User input - Every command and message you type  
+3. System events - Phase transitions, continue/quit commands
+4. Errors - Full tracebacks with color formatting
+5. Status updates - Checkpoints, restarts, etc.
+
+**Color Format (ANSI Codes)**:
+- `\033[97m` (White) - Timestamps `[HH:MM:SS.mmm TZ]`
+- `\033[96m` (Cyan) - Speaker labels `User:`, `Chair said:`, `Specialist said:`
+- `\033[92m` (Bright Green) - Message content (all speakers)
+- `\033[94m` (Bright Blue) - Search tool label `Search tool:`
+- `\033[93m` (Yellow) - System messages, warnings
+- `\033[91m` (Red) - Errors
+- `\033[0m` (Reset) - Returns to default color
+
+**Viewing the Log:**
+```bash
+# Live monitoring with colors (recommended)
+tail -f discussion.log
+
+# View entire log with colors
+cat discussion.log
+less -R discussion.log    # Paginated (-R preserves ANSI codes)
+
+# Search/parse
+grep "User:" discussion.log       # Search for user messages
+grep "Chair said" discussion.log  # Find Chair responses
+```
+
+**Log File Management:**
+```bash
+# Clear the log
+rm discussion.log           # Delete completely
+> discussion.log            # Empty but keep file
+
+# Archive logs by date
+mv discussion.log "discussion_$(date +%Y%m%d_%H%M%S).log"
+```
+
+The log is in **append mode** - each TUI session adds to it. Delete or archive when needed.
+
+**Tips:**
+1. Keep the log open in a split terminal - TUI on top, log on bottom
+2. Use grep for analysis - `grep "User:" discussion.log` shows all your inputs
+3. Review errors - `grep "Error" discussion.log` finds all issues
+4. Archive old sessions - Keep historical records for reference
+
+### Future Considerations
+
+The interactive TUI opens possibilities for additional commands:
+
+- `/invite [specialist]` - Bring specialist into room manually
+- `/dismiss [specialist]` - Remove specialist from room
+- `/search [query]` - Trigger search directly from UI
+- `/history` - Show full conversation history
+- `/export` - Export conversation to file
+
+These would require no core changes—all can be implemented in `main_tui.py` by manipulating state before graph execution.
+
+---
+
+## Recent Changes & Bug Fixes (2025-10-15)
+
+### Bug Fix: Final Phase Recognition by Specialists
+
+**Problem**: In Phase 11 (a final phase), only Ethicist and Chair posted messages. Context, Research, and Skeptic specialists did not contribute despite the rule "FINAL PHASE: You MUST contribute - passing is forbidden."
+
+**Root Cause** (`axion_swarm/agents.py` line 792):
+```python
+# OLD CODE (BROKEN):
+is_final = state.get("final_phase_needed", False)
+```
+
+The issue was timing: specialists run BEFORE Chair in each phase. Chair sets `final_phase_needed=True` at the end of a phase, but specialists check this flag at the START of the next phase before Chair runs. So:
+
+1. Phase 10 ends → Chair sets `final_phase_needed=True`
+2. Phase 11 starts → `start_phase` sets `final_phase_done=True`
+3. Specialists run → check `is_final = state.get("final_phase_needed", False)` → get `True`
+4. BUT if checking happened before `start_phase` runs, they'd get `False`
+
+The real bug was that specialists needed to check BOTH flags to recognize they're in the final phase.
+
+**Fix** (`axion_swarm/agents.py` lines 791-794):
+```python
+# NEW CODE (FIXED):
+# BUG FIX: Check BOTH final_phase_needed (for upcoming final) AND final_phase_done (for current final)
+# This ensures specialists recognize they're IN the final phase even before Chair runs
+is_final = state.get("final_phase_needed", False) or state.get("final_phase_done", False)
+```
+
+**Impact**: All core team specialists now correctly recognize final phase and must contribute mandatory assessments.
+
+---
+
+### Feature: Phase Reset After User Input
+
+**Motivation**: When a user responds during or after the final phase, the system should recognize that resolution has not been reached and continue discussion from Phase 3 (iterative refinement mode).
+
+**Implementation** (`main_tui.py` lines 1110-1162):
+
+1. **Detect final phase invalidation**: Check if `final_phase_needed` or `final_phase_done` is True when user provides input
+2. **Force Chair synthesis**: Invoke Chair to synthesize entire conversation (all phases) before reset
+3. **Set compression point**: `last_compression_message_index` = Chair's synthesis message index
+4. **Reset phase**: Set `phase_number = 2` (becomes 3 after `start_phase` increment)
+5. **Clear flags**: Both `final_phase_needed` and `final_phase_done` → False
+
+**Result**:
+- Specialists in new Phase 3 see only:
+  - All User messages (always visible)
+  - All Notice messages (always visible)  
+  - Chair's comprehensive synthesis (compression point)
+  - New Phase 3+ messages
+- Everything before compression point is hidden
+- Can have multiple cycles: discussion→final→user input→Phase 3→discussion→final
+
+**Phase Semantics**: Phase number represents "transition to resolution":
+- Phase 1-2: Far from resolution, need fresh perspectives
+- Phase 3+: Moving toward resolution iteratively
+- Final Phase: At resolution threshold (stagnation detected)
+- User input after final → Reset to Phase 3 (not at resolution anymore)
+
+---
+
+### Feature: Interactive Mode User Engagement Signals
+
+**Motivation**: TUI mode allows users to participate at any phase, while simple CLI mode only takes initial input. Stagnation detection should recognize active user engagement in interactive mode.
+
+**Implementation** (`axion_swarm/agents.py` lines 1997-2034):
+
+Added `interactive_mode` flag (set by TUI, False in simple CLI) that conditionally enables user engagement signals:
+
+1. **Recent User Response** (-30% if current phase, -15% if last phase)
+   - Only active when `interactive_mode=True`
+   - Justifies continuation when user is actively participating
+   
+2. **High User Engagement** (-20% if ≥3 user messages)
+   - Only active when `interactive_mode=True`
+   - Multiple inputs show collaborative discussion
+
+**Before**: These signals were disabled for all modes
+**After**: Enabled only in TUI mode where user can interact mid-discussion
+
+**Impact**: 
+- Simple CLI mode: User provides goal once → signals disabled (correct)
+- TUI mode: User can participate anytime → signals active (reduces premature final phase)
+
+---
+
+### Documentation: Phase Number Semantics
+
+**Update** (`ARCHITECTURE.md` lines 2319-2324, 2326-2378):
+
+Clarified that phase numbers represent **"transition to resolution"** rather than absolute discussion stage:
+
+- **Phase 1-2**: Far from resolution (mandatory fresh perspectives)
+- **Phase 3+**: Moving toward resolution (can pass if no value)
+- **Final**: At resolution threshold (mandatory contributions)
+- **Reset to Phase 3**: User input means not at resolution anymore
+
+This semantic meaning holds across multiple conversation flows, allowing stagnation detection to work correctly even after phase resets.
+
+---
+
+### Minor Enhancement: User Message Format
+
+**Change** (`axion_swarm/agents.py` line 3238):
+```python
+# OLD:
+content=f'Specialists, please help me with this concern: "{user_question}"'
+
+# NEW:
+content=user_question
+```
+
+**Rationale**: User messages should be direct content without wrapper text, matching how user input appears in later phases.
+
+---
+
+
+## TUI (Terminal User Interface) Architecture
+
+### Core UX Principle: NEVER Block User Feedback
+
+**CRITICAL RULE**: User feedback and system status updates MUST NEVER be blocked by specialist processing.
+
+**Rationale**:
+- Specialist LLM calls can take 10-60+ seconds in parallel
+- Users need immediate acknowledgment that their input was received (displaying the message IS the acknowledgment)
+- System state changes (phase transitions, specialist thinking) must be visible immediately
+- The user is the FIRST PRIORITY - not the specialists
+
+**Implementation** (`main_tui.py`):
+
+1. **Immediate Message Display** (serves as acknowledgment):
+   ```python
+   # User message displayed immediately - this IS the acknowledgment
+   await self.display_message(user_msg)
+   ```
+
+2. **Non-Blocking Notices**:
+   - `📢 Notice: Specialists are thinking... 🧠` - Shows BEFORE parallel LLM calls start
+   - Printed to stderr with `flush=True` for immediate display
+   - Captured and displayed via `StderrCapture` class
+
+3. **Processing State Tracking**:
+   - `self.processing_phase` flag tracks when specialists are in parallel execution
+   - User can send messages anytime - they're acknowledged immediately
+   - System shows "(queued - specialists are processing)" if sent during parallel block
+
+**Anti-Pattern (NEVER DO THIS)**:
+```python
+# BAD: Blocks until specialists finish
+specialist_results = await asyncio.gather(*tasks)
+# User sees nothing for 30+ seconds
+
+# GOOD: Show notice immediately, then process
+print("Notice: Specialists are thinking...", file=sys.stderr, flush=True)
+specialist_results = await asyncio.gather(*tasks)
+```
+
+---
+
+### TUI Features
+
+#### 1. @[User] Mentions Sidebar
+
+**Left Sidebar** (toggle with F2):
+- Collects ALL sentences containing `@[User]` from specialist messages
+- Two types:
+  - ❓ **Questions** (sentences with `?`) - sorted first
+  - ❗ **Statements** (sentences without `?`) - sorted second
+- Click to open modal with full message context
+- Collapsed: Shows first 20 chars of each mention
+- Expanded: Shows full sentence text
+
+**Automatic Phase Blocking:**
+- ❓ questions **block** discussion progression immediately
+- When any "?" appears → system pauses and shows Notice
+- When last "?" cleared → system automatically resumes next phase
+- No manual intervention required (`/continue` not needed)
+
+**Implementation**: `main_tui.py` lines 579-667
+- `extract_user_mention_sentences()` - extracts and categorizes mentions
+- `sort_and_render_mentions()` - keeps list sorted (questions first)
+- `add_user_mention()` - adds new mentions and re-sorts
+- Lines 875-885: Immediate blocking check after each message
+- Lines 454-495, 1337-1360: Automatic unblock and graph restart
+
+#### 2. Mention Detail Modal
+
+**Modal Pop-up** (appears when clicking sidebar item):
+- Shows full original message with timestamp and speaker
+- Scrollable content area
+- Conditional buttons based on mention type:
+  - **Questions (❓)**:
+    - "Close (ESC)" - dismiss modal
+    - "Reply" - pre-populates input with `@[Speaker], ` and focuses it
+    - "Remove from To-Do" - removes from sidebar
+  - **Statements (❗)**:
+    - "Close (ESC)" - dismiss modal
+    - "Remove from To-Do" - removes from sidebar
+    - NO Reply button (not a question)
+
+**Implementation**: `main_tui.py` class `MentionDetailModal` lines 215-299
+
+#### 3. Auto-Collapse Long Messages
+
+**Statistical Auto-Collapse**:
+- Tracks byte length of ALL messages
+- Collapses messages > mean + 2σ automatically
+- Shows:
+  - Full speaker line (timestamp + emoji + name)
+  - First 2 lines of content
+  - Stats: `[bytes, lines - collapsed]`
+  - Expand/collapse commands
+
+**Commands**:
+- `/expand <id>` - Show full message
+- `/collapse <id>` - Re-collapse expanded message
+
+**Implementation**: `main_tui.py` lines 459-577
+- `should_collapse_message()` - calculates 2σ threshold
+- `format_collapsed_message()` - creates collapsed view
+- Stores all 4 versions: full TUI, full log, collapsed TUI, collapsed log
+
+#### 4. Speaker Emojis
+
+**Visual Differentiation**:
+- 📢 **Notice** - System announcements
+- 💬 **User** - User messages (speech balloon)
+- ⚖️ **Chair** - Chair agent (scales/balance)
+- 🤖 **Specialists** - All AI specialists except Chair
+- 🔍 **Search tool** - Web search results
+- 📰 **ReadURL tool** - Webpage content
+- ⚙️ **System/Debug** - [CHAIR], [DEBUG], [SEARCH], [GRAPH], checkpoints, errors
+
+**Implementation**: `main_tui.py` lines 815-880 in `display_message()`
+
+#### 5. Color System
+
+**Exact ANSI/Rich Color Parity**:
+- All colors match between TUI and non-TUI mode
+- ANSI codes for `discussion.log`
+- Rich markup for TUI display
+- No auto-highlighting (explicitly disabled)
+
+**Color Mappings**:
+- `@[User]` → Light blue (color(12) / ANSI 94)
+- `@[Specialists]` → Light purple (color(13) / ANSI 95)
+- `requester="User"` → Light blue
+- `requester="Specialist"` → Light purple
+- Base text → Light green (color(10) / ANSI 92)
+- Speaker labels → Cyan (color(14) / ANSI 96)
+- Timestamps → White (color(15) / ANSI 97)
+
+**Implementation**: `main_tui.py` function `highlight_mentions()` lines 63-212
+
+#### 6. Scrolling and Navigation
+
+**Keybindings**:
+- **F2** - Expand/Collapse To-Do (toggles User To-Do sidebar)
+- **Page Up/Down** - Scroll main conversation by page
+- **Home/End** - Jump to top/bottom
+- **ESC** - Close modal pop-ups
+- **Ctrl+C / Ctrl+D** - Quit application
+
+**Commands**:
+- `/continue` - Manually proceed to next phase (optional; system auto-resumes when "?" to-dos cleared)
+- `/status` - Show current phase, specialists, message counts
+- `/expand <id>` - Expand collapsed message
+- `/collapse <id>` - Re-collapse expanded message
+- `/quit` - Exit the discussion
+- `/help` - Show all commands and keybindings
+
+---
+
+### Message Flow Architecture
+
+```
+User Input
+    ↓
+[IMMEDIATE] Display user message
+    ↓
+[IMMEDIATE] Show "✓ Message received" acknowledgment
+    ↓
+Add to state.messages
+    ↓
+Continue/restart graph (non-blocking)
+    ↓
+    ↓ [Parallel Block Starts]
+    ↓
+[IMMEDIATE] "📢 Notice: Specialists are thinking... 🧠"
+    ↓
+[BLOCKING] await asyncio.gather(*specialist_tasks)
+    ↓ (30+ seconds of LLM calls)
+    ↓
+[IMMEDIATE] Display specialist responses as they arrive
+    ↓
+[IMMEDIATE] Chair response
+    ↓
+[IMMEDIATE] Pause notice (if Phase 3+)
+```
+
+**Key Points**:
+1. User message → INSTANT feedback
+2. Notice → INSTANT (before specialists start)
+3. Parallel LLM calls → User already knows what's happening
+4. Additional user messages during parallel → Queued with acknowledgment
+
+---
+
+### Stderr Capture System
+
+**Purpose**: Display library-generated messages (graph internals) in TUI
+
+**Implementation** (`main_tui.py` lines 39-61):
+```python
+class StderrCapture:
+    def write(self, text):
+        if self.tui_app:
+            self.tui_app.display_stderr_message(text)
+    def flush(self):
+        self.original_stderr.flush()
+```
+
+**Captures**:
+- `[CHAIR]` - Chair internal messages (yellow)
+- `[DEBUG]` - Debug output (plain)
+- `[SEARCH]` - Search tool activity (plain)
+- `[GRAPH]` - Graph execution events (plain)
+- `💾 Checkpoint saved` - Checkpoint operations (plain)
+- Errors and stack traces (yellow)
+
+All captured messages prefixed with ⚙️ (gear emoji) to distinguish from conversation.
+
+---
+
+### Logging Architecture
+
+**Dual Output**:
+1. **TUI Display** - Rich markup for terminal UI
+2. **discussion.log** - ANSI escape codes (exact non-TUI format)
+
+**Both include**:
+- Full conversation transcript
+- All specialist messages
+- User inputs
+- System notices
+- Checkpoint operations
+- Errors and warnings
+
+**Viewing Log**:
+```bash
+# With colors (recommended)
+./view_log.sh
+
+# Or
+less -R discussion.log
+```
+
+**Implementation**: All messages formatted twice in `display_message()` - once for Rich markup, once for ANSI codes
+
+---
+
+### Recent Additions (2025-10-15)
+
+1. **Sorted To-Do List** - Questions (❓) always above statements (❗)
+2. **Modal Pop-ups** - Clean UX for reviewing and responding to mentions
+3. **Immediate Acknowledgment** - Never block user for specialists
+4. **Conditional Reply Button** - Only questions get "Reply" button in modal
+5. **Processing State Feedback** - Clear indication when specialists are thinking
+
+### Phase Blocking & Notice Refinements (2025-10-15 Late Session)
+
+#### 1. Phase Boundary Question Blocking
+
+**Design Choice:** Questions checked at phase END (after save_checkpoint), allowing all specialists to finish.
+
+**Rationale:**
+- All specialists in a phase should be able to complete their messages
+- Questions added to to-do list as messages arrive (non-blocking)
+- At phase boundary: check for questions and block BEFORE moving to next phase
+- User sees complete picture from all specialists before being asked to respond
+
+**Implementation** (`main_tui.py` lines 845-866):
+- Only check and block at `save_checkpoint` node (phase boundary)
+- Let all parallel specialist messages complete first
+- Then pause if questions detected
+
+#### 2. Automatic Graph Restart on Unblock
+
+**Problem:** When last "?" cleared, Notice was shown but graph never restarted → discussion appeared frozen.
+
+**Solution** (`main_tui.py` lines 488-490, 536-538, 1358-1360):
+- After showing unblocking Notice, immediately call `self.graph_task = asyncio.create_task(self.run_graph())`
+- Works for all three unblock paths:
+  1. Dismissing last "?" via "Remove from To-Do" button
+  2. Replying to last "?" (auto-dismiss)
+  3. Sending message after manually clearing last "?"
+
+#### 3. No Repeated Blocking Notices
+
+**Problem:** Every time user replied to a question or removed one, system showed "Discussion paused. X question(s) remain" again.
+
+**Solution** (`main_tui.py` lines 1042-1078, 1338-1340):
+- Blocking Notice shown **ONCE** when transitioning from unblocked → blocked
+- Dismissing/replying to questions while others remain → **silent** (no notice)
+- Only show Notice again when **unblocking** (all questions cleared)
+
+**Result:** Clean UX - one blocking notice, silence while working through questions, one unblocking notice.
+
+#### 4. System State Debug Messages
+
+**Refinement:** Changed emoji from 🟠 (orange circle) to ⚙️ (gear) for all system messages:
+- `⚙️ Starting discussion processing...`
+- `⚙️ System state: WAITING_FOR_USER | Questions remaining: X`
+- `⚙️ System state: UNBLOCKED | All questions resolved`
+
+**Rationale:** Gear emoji better represents system/internal operations and matches existing debug message style.
+
+#### 5. F2 Keybinding Label
+
+**Final Label:** "F2: Expand/Collapse To-Do"
+- Static label describes both actions (toggle behavior)
+- Textual framework doesn't support truly dynamic binding labels in Footer
+- Clear enough for users to understand the toggle behavior
+
+**Implementation** (`main_tui.py` line 389)
+
+#### 6. Duplicate Prevention & Message Display Tracking (2025-10-15 Final)
+
+**Problem:** Multiple duplicates appearing in conversation and to-do list:
+1. Phase start notices appearing twice when unblocking
+2. Same message creating multiple to-do items (one per sentence)
+3. Old messages re-displaying when graph restarted
+
+**Solutions:**
+
+**A. Message Display Tracking** (`main_tui.py` lines 420, 836-842):
+- Added `displayed_message_count` to track how many messages we've shown
+- Only display new messages beyond that count when graph streams
+- Prevents re-displaying old messages when graph restarts after unblocking
+
+**B. Deferred Graph Restart** (`main_tui.py` lines 405, 493-500, 1369-1378):
+- Added `need_graph_restart` flag to coordinate restart timing
+- When auto-dismissing during reply: set flag instead of restarting immediately
+- After user message added to state: check flag and restart once
+- Prevents double restart (once from auto-dismiss, once from message send)
+
+**C. One To-Do Per Message** (`main_tui.py` lines 665-698):
+- Changed from sentence-splitting to whole-message approach
+- Each message with @[User] creates exactly ONE to-do item
+- Full message content shown in to-do (not individual sentences)
+- Duplicate check by `message_index` prevents re-adding same message
+
+**D. Question Detection After @[User]** (`main_tui.py` lines 676-680):
+```python
+# Check if there's a '?' AFTER the @[User] mention
+user_mention_pos = content.find('@[User]')
+text_after_user = content[user_mention_pos:]
+has_question_mark = '?' in text_after_user
+```
+- Only checks for '?' after @[User] appears in message
+- Prevents false positives from '?' before the mention
+
+**Result:** Zero duplicates in conversation, zero duplicate to-do items, clean phase transitions! 🎉
+
+---

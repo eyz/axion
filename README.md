@@ -52,7 +52,8 @@ Specialists can access current information through two complementary tools:
 - **Natural consensus**: System detects when all specialists pass (implicit agreement)
 
 ### Production-Ready Features
-- **Checkpoint/Resume**: Automatic state persistence with config validation
+- **Interactive TUI Mode**: Real-time chat interface with automatic question blocking—specialists' @[User] questions pause phase progression until answered. Features collapsible messages (2σ auto-collapse), interactive to-do sidebar (F2), modal message view with reply/dismiss actions, and Final Phase invalidation
+- **Checkpoint/Resume**: Automatic state persistence with config validation, checkpoint saved just before phase starts
 - **Rate limit handling**: Automatic retry with global coordination across parallel agents
 - **Token tracking**: Per-agent visibility into context utilization
 - **Think transparency**: All reasoning visible on stderr (dark green), never shared with other agents
@@ -105,13 +106,27 @@ OLLAMA_NUM_CTX=36992
 TAVILY_API_KEY=your-tavily-key
 ```
 
-See [TAVILY_SEARCH_SETUP.md](TAVILY_SEARCH_SETUP.md) for search configuration.
-
 ### Run
 
+**Simple CLI Mode** (single prompt at start):
 ```bash
 python main.py
 ```
+
+**Interactive TUI Mode** (real-time chat with automatic question blocking):
+```bash
+python main_tui.py
+```
+
+**TUI Features:**
+- Real-time message injection at any phase
+- Automatic phase blocking when specialists ask @[User] questions
+- Interactive to-do sidebar (F2 to toggle) with click-to-reply
+- Statistical auto-collapse for long messages (2σ threshold)
+- Scrollable conversation history with speaker emojis
+- Keybindings: Ctrl+C/Ctrl+D (quit), Page Up/Down (scroll), Home/End
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for complete TUI documentation and keyboard shortcuts.
 
 ---
 
@@ -123,7 +138,8 @@ Axion Swarm uses LangGraph for state management and workflow orchestration. Spec
 
 | File | Purpose |
 |------|---------|
-| [`main.py`](main.py) | Entry point, user interaction, output display |
+| [`main.py`](main.py) | Simple CLI mode entry point |
+| [`main_tui.py`](main_tui.py) | Interactive TUI mode with Textual (1494 lines) |
 | [`axion_swarm/agents.py`](axion_swarm/agents.py) | Agent functions, message filtering, parallel execution |
 | [`axion_swarm/graph.py`](axion_swarm/graph.py) | LangGraph workflow definition |
 | [`axion_swarm/state.py`](axion_swarm/state.py) | State schema (TypedDict) |
@@ -132,6 +148,7 @@ Axion Swarm uses LangGraph for state management and workflow orchestration. Spec
 | [`axion_swarm/checkpoint.py`](axion_swarm/checkpoint.py) | Automatic state persistence and resume |
 | [`axion_swarm/search.py`](axion_swarm/search.py) | Tavily search integration |
 | [`axion_swarm/colors.py`](axion_swarm/colors.py) | ANSI color utilities for console output |
+| [`view_log.py`](view_log.py) / [`view_log.sh`](view_log.sh) | Log viewing utilities with ANSI color support |
 
 ### Key Architectural Patterns
 
@@ -208,16 +225,23 @@ See [`axion_swarm/config.py`](axion_swarm/config.py) for complete configuration 
 
 ## 📖 Documentation
 
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Complete technical documentation (6,584 lines)
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Complete technical documentation (8,100+ lines)
   - Core architecture and design philosophy
-  - Phase system with atomic filtering
+  - Phase system with atomic filtering (including phase reset logic)
   - Message formats and filtering logic
   - Agent roster management
   - Parallel execution architecture
-  - Checkpoint system
-  - Recent changes and debugging guide
-
-- **[TAVILY_SEARCH_SETUP.md](TAVILY_SEARCH_SETUP.md)** - Search integration setup
+  - Checkpoint system with reordered flow
+  - Search tool setup (Tavily API configuration)
+  - **Interactive TUI mode** - Complete guide:
+    - Automatic question blocking architecture
+    - To-do sidebar with click-to-reply modals
+    - Statistical auto-collapse (2σ threshold)
+    - Keyboard shortcuts and navigation
+    - Final Phase invalidation
+    - Event handling and state management
+    - TUI logging to discussion.log
+  - Recent changes & bug fixes (message display, double phase starts, keybindings)
 
 ---
 
@@ -258,6 +282,7 @@ This is a sophisticated multi-agent system with careful architectural considerat
 Built with:
 - [LangGraph](https://github.com/langchain-ai/langgraph) - State management and workflow orchestration
 - [LangChain](https://github.com/langchain-ai/langchain) - LLM abstractions
+- [Textual](https://github.com/Textualize/textual) - Terminal user interface framework
 - [Tavily](https://tavily.com) - LLM-optimized search API
 - [Ollama](https://ollama.ai) - Local LLM runtime
 - [Azure OpenAI](https://azure.microsoft.com/en-us/products/ai-services/openai-service) - Hosted LLM service
