@@ -18,14 +18,20 @@ Azure OpenAI Configuration (environment variables):
         (REQUIRED - from Azure Portal > Your OpenAI Resource > Keys and Endpoint)
     AZURE_OPENAI_API_KEY=[key-from-azure-portal]
         (REQUIRED - from Azure Portal > Your OpenAI Resource > Keys and Endpoint > KEY 1)
-    AZURE_OPENAI_MODEL=gpt-5-mini (default)
-    AZURE_OPENAI_DEPLOYMENT=gpt-5-mini (default)
+    AZURE_OPENAI_MODEL_AND_DEPLOYMENT=gpt-5-mini (default: "gpt-5-mini")
+        (Sets both model_name and deployment - they must match)
+        (Supports: "gpt-5-mini", "gpt-5-nano")
     AZURE_OPENAI_API_VERSION=2024-12-01-preview (default)
     AZURE_OPENAI_MAX_TOKENS=128000 (default: 128K, max output tokens)
+    AZURE_OPENAI_REASONING_EFFORT=high (default: "high", values: "high"|"medium"|"low"|"minimal")
     
     IMPORTANT: AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY are REQUIRED when using
     Azure OpenAI provider. The application will raise an error if not provided.
-    AZURE_OPENAI_REASONING_EFFORT=high (default: "high", values: "high"|"medium"|"low"|"minimal")
+    
+    PHASE-SPECIFIC SETTINGS (automatic, overrides defaults for Phase 1-2):
+        Phase 1: reasoning_effort="medium" (solid initial perspectives)
+        Phase 2: reasoning_effort="medium" (thoughtful integration)
+        Phase 3+: reasoning_effort="high" (full depth for sustained discussion)
 
 Ollama Configuration (environment variables):
 ----------------------------------------------
@@ -174,23 +180,30 @@ DEFAULT_MODEL_TUPLE = MODEL_QWEN3_30B_Q5_K_M
 class AzureOpenAIConfig:
     """Configuration for Azure OpenAI provider.
     
-    gpt-5-mini specifications:
+    Supported models (set via AZURE_OPENAI_MODEL_AND_DEPLOYMENT):
+    - gpt-5-mini: Standard GPT-5 model
+    - gpt-5-nano: Faster, lighter GPT-5 model
+    
+    gpt-5-mini/nano specifications:
     - Total context window: 400,000 tokens
     - Max input tokens: 272,000 tokens
     - Max output tokens: 128,000 tokens
     - max_tokens parameter controls OUTPUT tokens only (completion/response length)
     
-    IMPORTANT: gpt-5-mini only supports default sampling parameters:
+    IMPORTANT: gpt-5-mini/nano only support default sampling parameters:
     - temperature: 1.0 (default, not configurable)
     - top_p: default (not configurable)
     - Custom temperature/top_p values will cause 400 errors
     
     reasoning_effort parameter:
-    - Controls depth of reasoning for GPT-5 Mini
+    - Controls depth of reasoning for GPT-5 models
     - Values: "minimal", "low", "medium", "high"
-    - Default: "medium"
+    - Default: "high"
     - "high" = deeper reasoning, more thinking time (recommended for complex tasks)
-    """
+    - Phase-specific: Phase 1-2 use "medium", Phase 3+ uses "high"
+    
+    NOTE: model_name and deployment must be identical (set via single env var)
+"""
     endpoint: str
     model_name: str
     deployment: str
@@ -253,10 +266,13 @@ class SwarmConfig:
                     "Set it: export AZURE_OPENAI_API_KEY=[your-key-from-azure-portal]"
                 )
         
+        # Use single env var for both model_name and deployment (they must match)
+        model_and_deployment = os.getenv("AZURE_OPENAI_MODEL_AND_DEPLOYMENT", "gpt-5-mini")
+        
         self.azure_config = AzureOpenAIConfig(
             endpoint=azure_endpoint or "",
-            model_name=os.getenv("AZURE_OPENAI_MODEL", "gpt-5-mini"),
-            deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini"),
+            model_name=model_and_deployment,
+            deployment=model_and_deployment,
             api_key=azure_api_key or "",
             api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
             max_tokens=int(os.getenv("AZURE_OPENAI_MAX_TOKENS", "128000")),

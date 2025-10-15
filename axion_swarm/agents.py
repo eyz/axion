@@ -3,14 +3,16 @@
 import re
 import sys
 import time
+import json
 import asyncio
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Union, List, Dict, Callable
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_ollama import ChatOllama
 from langchain_openai import AzureChatOpenAI
-from openai import RateLimitError
+from openai import RateLimitError, BadRequestError
 import tiktoken
 
 from .state import OverallState
@@ -21,9 +23,14 @@ from .search import (
     perform_tavily_search, read_url_with_jina,
     format_search_results, format_readurl_results
 )
+from .graph_tool import (
+    detect_graph_requests, process_graph_operations,
+    QuestionGraph
+)
 from .prompts import (
     CHAIR_SYSTEM,
     CHAIR_RATE_LIMIT_COMPRESSION_SYSTEM,
+    CHAIR_DEDUPE_PASS_SYSTEM,
     RESEARCH_SYSTEM,
     ENGINEER_SYSTEM,
     SKEPTIC_SYSTEM,
@@ -193,6 +200,63 @@ def should_compress_after_rate_limit(state: Dict) -> bool:
     return True
 
 
+def log_denied_request(agent_name: str, messages: List[BaseMessage], error: BadRequestError):
+    """Log denied LLM requests to 400s.log for analysis.
+    
+    When OpenAI returns a 400 error (BadRequestError), it's often due to content policy
+    violations or prompt refusal. This function appends the full context to 400s.log.
+    
+    Args:
+        agent_name: Name of the agent/specialist that made the request
+        messages: Complete message history that was sent to the LLM
+        error: The BadRequestError exception from OpenAI
+    """
+    try:
+        log_path = Path("400s.log")
+        timestamp = datetime.now().isoformat()
+        
+        # Format the messages for logging
+        formatted_messages = []
+        for msg in messages:
+            msg_dict = {
+                "role": getattr(msg, "name", msg.__class__.__name__),
+                "content": msg.content if hasattr(msg, "content") else str(msg)
+            }
+            if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
+                msg_dict["metadata"] = msg.additional_kwargs
+            formatted_messages.append(msg_dict)
+        
+        # Create log entry with full request and response details
+        log_entry = {
+            "timestamp": timestamp,
+            "agent": agent_name,
+            "error": str(error),
+            "error_type": error.__class__.__name__,
+            "status_code": getattr(error, "status_code", 400),
+            "response": {
+                "body": getattr(error, "body", None),
+                "response": getattr(error, "response", None)
+            },
+            "messages": formatted_messages,
+            "message_count": len(messages),
+            "total_chars": sum(len(msg.content) for msg in messages if hasattr(msg, "content"))
+        }
+        
+        # Append to 400s.log
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(json.dumps(log_entry, indent=2, ensure_ascii=False))
+            f.write("\n" + "=" * 80 + "\n\n")
+        
+        print(f"⚠️  Logged 400 response to 400s.log (agent: {agent_name})", 
+              file=sys.stderr, flush=True)
+    
+    except Exception as log_error:
+        # Don't let logging errors crash the system
+        print(f"⚠️  Failed to log 400 response: {log_error}", 
+              file=sys.stderr, flush=True)
+
+
 # Agent roster - canonical execution order
 # Chair always goes LAST to synthesize all other contributions
 #
@@ -204,6 +268,7 @@ def should_compress_after_rate_limit(state: Dict) -> bool:
 #   Legal: legalresearch, compliance, contractanalysis
 #   Medical: clinical, researchspecialist, bioethics
 #   Business: marketanalysis, finance, operations
+# - Chair always goes LAST to synthesize all contributions
 AGENT_ROSTER = [
     "context",
     "research", 
@@ -221,6 +286,14 @@ AGENT_ROSTER = [
     "technicalwriter",
     "hr",
     "chair"
+]
+
+# Synthesis specialists - These specialists see current phase messages (not just prior phases)
+# because their role is to consolidate/synthesize what was said in the current phase
+# - Chair: Synthesizes all specialist contributions
+# (Future: additional synthesis specialists can be added for specific consolidation roles)
+SYNTHESIS_SPECIALISTS = [
+    "Chair",
 ]
 
 
@@ -452,7 +525,6 @@ def auto_dismiss_non_core_specialists(
         - Updated specialist_presence dict (or None if no changes)
         - List of Notice messages for dismissed specialists
     """
-    import re
     from axion_swarm.config import get_core_team
     
     core_team = get_core_team()
@@ -688,11 +760,44 @@ def get_config() -> SwarmConfig:
     return _config
 
 
-def get_llm(agent_name: str, agent_config: AgentConfig) -> Union[ChatOllama, AzureChatOpenAI]:
+def get_phase_specific_settings(phase_number: int, azure_config) -> dict:
+    """Get phase-specific reasoning effort settings.
+    
+    Phase 1: Medium effort (solid initial perspectives)
+    Phase 2: Medium effort (thoughtful integration of multiple perspectives)
+    Phase 3+: High effort (full depth for sustained discussion)
+    
+    Args:
+        phase_number: Current phase number
+        azure_config: Base Azure config with default settings
+        
+    Returns:
+        Dict with reasoning_effort for the phase
+    """
+    if phase_number == 1:
+        return {
+            "reasoning_effort": "medium"
+        }
+    elif phase_number == 2:
+        return {
+            "reasoning_effort": "medium"
+        }
+    else:  # Phase 3+
+        return {
+            "reasoning_effort": azure_config.reasoning_effort  # Default: "high"
+        }
+
+
+def get_llm(agent_name: str, agent_config: AgentConfig, phase_number: int = None) -> Union[ChatOllama, AzureChatOpenAI]:
     """Create a fresh LLM instance for each agent invocation to ensure complete isolation.
     
     Returns either ChatOllama (for local models) or AzureChatOpenAI (for hosted Azure OpenAI),
     depending on the provider configuration.
+    
+    Args:
+        agent_name: Name of the agent
+        agent_config: Configuration for the agent
+        phase_number: Current phase number for phase-specific settings (Azure OpenAI only)
     """
     # ALWAYS create a fresh instance to ensure no context leakage between calls
     # Each invocation gets a completely independent LLM instance
@@ -704,7 +809,15 @@ def get_llm(agent_name: str, agent_config: AgentConfig) -> Union[ChatOllama, Azu
         
         azure_config = agent_config.azure_config
         
-        # Note: gpt-5-mini only supports default temperature (1.0) and other defaults
+        # Get phase-specific settings if phase_number provided
+        if phase_number is not None:
+            phase_settings = get_phase_specific_settings(phase_number, azure_config)
+            reasoning_effort = phase_settings["reasoning_effort"]
+        else:
+            # Use defaults from config
+            reasoning_effort = azure_config.reasoning_effort
+        
+        # Note: GPT-5 models (gpt-5-mini, gpt-5-nano) only support default temperature (1.0)
         # Do NOT pass temperature, top_p, or other sampling parameters
         # However, reasoning_effort IS supported to control reasoning depth
         llm = AzureChatOpenAI(
@@ -713,9 +826,9 @@ def get_llm(agent_name: str, agent_config: AgentConfig) -> Union[ChatOllama, Azu
             api_key=azure_config.api_key,
             api_version=azure_config.api_version,
             max_tokens=azure_config.max_tokens,
-            reasoning_effort=azure_config.reasoning_effort,  # "high", "medium", "low", or "minimal"
-            # Do NOT set temperature, top_p, top_k, min_p for gpt-5-mini
-            # Model only supports default values
+            reasoning_effort=reasoning_effort,
+            # Do NOT set temperature, top_p, top_k, min_p for GPT-5 models
+            # These models only support default values
         )
         
         return llm
@@ -769,6 +882,97 @@ def count_tokens_in_messages(messages: list) -> int:
     return total_tokens
 
 
+def build_active_graph_context() -> str:
+    """Build compact list of active graph paths for specialist context.
+    
+    Shows non-dismissed, non-duplicate paths so specialists can:
+    - Vote with @[Graph][Update][exact path][👍/👎][comment]
+    - Extend with @[Graph][Create][existing path][Q:type][new nested question]
+    - Build upon with @[Graph][Create][existing path][A][new answer]
+    
+    Returns empty string if no active paths exist.
+    """
+    from pathlib import Path
+    
+    if not Path('graph.log').exists():
+        return ""
+    
+    try:
+        # Parse graph.log to get all paths
+        from graph_parser import analyze_graph_log
+        nodes, vote_tally, specialist_stats = analyze_graph_log('graph.log')
+        
+        # Filter to active paths only (not dismissed, not duplicates)
+        active_paths = []
+        for path, node in nodes.items():
+            # Skip if dismissed (any ❌ or X vote)
+            has_dismiss = any(v.get('vote') in ['❌', 'X'] for v in node.get('votes', []))
+            if has_dismiss:
+                continue
+            
+            # Skip if marked duplicate by Chair
+            has_duplicate = any(
+                v.get('vote') == '🧹' and v.get('specialist') == 'Chair' 
+                for v in node.get('votes', [])
+            )
+            if has_duplicate:
+                continue
+            
+            active_paths.append(path)
+        
+        if not active_paths:
+            return ""
+        
+        # Build compact hierarchical list
+        lines = ["\n" + "="*80]
+        lines.append("ACTIVE GRAPH PATHS:")
+        lines.append("="*80)
+        lines.append("")
+        lines.append("These are the current active paths in the collaborative graph.")
+        lines.append("Use these to:")
+        lines.append("  • Vote with @[Graph][Update][exact path][👍/👎][comment]")
+        lines.append("  • Extend with @[Graph][Create][existing path][Q:type][new nested question]")
+        lines.append("  • Build upon with @[Graph][Create][existing path][A][new answer]")
+        lines.append("")
+        lines.append("Copy exact paths - do not paraphrase or invent new question titles.")
+        lines.append("")
+        
+        # Group by root question
+        root_questions = [p for p in active_paths if p.count('[Q:') == 1 and p.endswith(']')]
+        
+        for root_q in sorted(root_questions):
+            lines.append(f"• {root_q}")
+            
+            # Find direct answers under this question
+            q_prefix = root_q + '[A'
+            answers = [p for p in active_paths if p.startswith(q_prefix) and p.count('[Q:') == 1]
+            for answer in sorted(answers):
+                answer_text = answer.replace(root_q, '')
+                # Truncate long answers
+                if len(answer_text) > 100:
+                    answer_text = answer_text[:97] + '...'
+                lines.append(f"  - {answer_text}")
+                
+                # Find nested questions under this answer (limit to keep compact)
+                nested_qs = [p for p in active_paths if p.startswith(answer + '[Q:') and p.count('[Q:') == 2]
+                for nested_q in sorted(nested_qs)[:2]:  # Limit to 2 nested per answer
+                    nested_text = nested_q.replace(answer, '')
+                    if len(nested_text) > 80:
+                        nested_text = nested_text[:77] + '...'
+                    lines.append(f"    └─ {nested_text}")
+        
+        lines.append("")
+        lines.append("Dismissed (❌) and duplicate (🧹) paths are hidden - these are active paths only.")
+        lines.append("="*80 + "\n")
+        
+        return '\n'.join(lines)
+        
+    except Exception as e:
+        # If graph parsing fails, return empty string (don't break agent execution)
+        print(f"Warning: Could not build graph context: {e}", file=sys.stderr)
+        return ""
+
+
 def create_agent_func(name: str, system_prompt: str, agent_config: AgentConfig, specialist_count: int = None):
     """Create an agent that participates in phases.
     
@@ -785,8 +989,12 @@ def create_agent_func(name: str, system_prompt: str, agent_config: AgentConfig, 
         # Get global config for system-wide settings
         config = get_config()
         
+        # Get current phase number for phase-specific settings
+        current_phase = state.get("phase_number", 1)
+        
         # Create a fresh LLM instance for this invocation (complete isolation, no context sharing)
-        llm = get_llm(name, agent_config)
+        # Pass phase_number for phase-specific reasoning effort and text verbosity
+        llm = get_llm(name, agent_config, phase_number=current_phase)
         
         # Check if this is the final phase - use different system prompt
         # BUG FIX: Check BOTH final_phase_needed (for upcoming final) AND final_phase_done (for current final)
@@ -933,6 +1141,11 @@ You MUST contribute - passing is forbidden in the final phase.
                     debug_output_buffer.append(f"{'='*80}\n")
                 messages.append(HumanMessage(content=conversation_text))
             
+            # Add active graph context (if graph exists)
+            graph_context = build_active_graph_context()
+            if graph_context:
+                messages.append(HumanMessage(content=graph_context))
+            
             messages.append(HumanMessage(content=f"""Provide your initial fresh perspective as {name} specialist.
 
 <think>
@@ -969,17 +1182,17 @@ GUIDANCE: Contribute when your specific expertise can help answer their explicit
             if history_messages:
                 conversation_text = f"\n{'='*80}\n"
                 
-                # Chair sees current phase (goes last), others see only prior phases
-                is_chair = (name == "Chair")
+                # Synthesis specialists (Chair) see current phase, others see only prior phases
+                is_synthesis_specialist = (name in SYNTHESIS_SPECIALISTS)
                 
                 if is_final:
                     conversation_text += f"WHAT OTHER SPECIALISTS DISCUSSED\n"
                     conversation_text += f"(Your own previous contributions are hidden - you're seeing only what others said)\n"
-                elif is_chair:
+                elif is_synthesis_specialist:
                     conversation_text += f"WHAT OTHER SPECIALISTS DISCUSSED\n"
-                    conversation_text += f"(You're seeing what others said in Phase 1 AND Phase {current_phase} - you go last)\n"
+                    conversation_text += f"(You're seeing what others said in Phase 1 AND Phase {current_phase} - you synthesize after others speak)\n"
                     conversation_text += f"(Your own Phase 1 response is hidden)\n"
-                else:  # Non-Chair Phase 2
+                else:  # Regular specialists - Phase 2
                     conversation_text += f"WHAT OTHER SPECIALISTS DISCUSSED IN PRIOR PHASES\n"
                     conversation_text += f"(You're seeing what others said in Phase 1, not your own Phase 1 response)\n"
                     conversation_text += f"(Specialist messages from current Phase 2 are not yet visible - you only see prior phases)\n"
@@ -1017,11 +1230,11 @@ GUIDANCE: Contribute when your specific expertise can help answer their explicit
                     elif is_final:
                         # Final phase: show all prior phases
                         visible = True
-                    elif is_chair:
-                        # Chair sees current phase (goes last) - show all other specialists
+                    elif is_synthesis_specialist:
+                        # Synthesis specialists see current phase (to consolidate/synthesize) - show all other specialists
                         visible = True
                     elif msg_phase < current_phase:
-                        # Non-Chair: only show PRIOR phases
+                        # Regular specialists: only show PRIOR phases
                         visible = True
                     
                     if visible:
@@ -1033,8 +1246,8 @@ GUIDANCE: Contribute when your specific expertise can help answer their explicit
                             debug_output_buffer.append(red("✗") + " | " + red(f"FILTERED: {elide_xml_content(xml_msg)}"))
                 
                 conversation_text += f"{'='*80}\n"
-                if is_chair and not is_final:
-                    conversation_text += f"END OF DISCUSSION (including current phase - you go last)\n"
+                if is_synthesis_specialist and not is_final:
+                    conversation_text += f"END OF DISCUSSION (including current phase - you synthesize after others)\n"
                 else:
                     conversation_text += f"END OF PRIOR PHASES' DISCUSSION\n"
                 conversation_text += f"{'='*80}\n"
@@ -1042,6 +1255,11 @@ GUIDANCE: Contribute when your specific expertise can help answer their explicit
                     debug_output_buffer.append(f"{'='*80}\n")
                 
                 messages.append(HumanMessage(content=conversation_text))
+                
+                # Add active graph context (if graph exists)
+                graph_context = build_active_graph_context()
+                if graph_context:
+                    messages.append(HumanMessage(content=graph_context))
             else:
                 messages.append(HumanMessage(content="\n[No conversation history yet]\n"))
         
@@ -1050,15 +1268,15 @@ GUIDANCE: Contribute when your specific expertise can help answer their explicit
             # Check if compression is enabled (hide Phase 1 & 2 individual responses)
             compress = config.compress_history_after_phase3 and current_phase >= 3
             
-            # Chair sees current phase (goes last), others see only prior phases
-            is_chair = (name == "Chair")
+            # Synthesis specialists (Chair, User Communication) see current phase, others see only prior phases
+            is_synthesis_specialist = (name in SYNTHESIS_SPECIALISTS)
             
             if compress:
                 conversation_text = f"\n{'='*80}\n"
                 conversation_text += f"COMPRESSED CONVERSATION HISTORY\n"
                 conversation_text += f"(Phase 1 & 2 individual responses compressed into Chair's Phase 2 synthesis)\n"
-                if is_chair:
-                    conversation_text += f"(You're seeing all messages including current Phase {current_phase} - you go last)\n"
+                if is_synthesis_specialist:
+                    conversation_text += f"(You're seeing all messages including current Phase {current_phase} - you synthesize after others speak)\n"
                 else:
                     conversation_text += f"(Specialist messages from current Phase {current_phase} not yet visible)\n"
                 conversation_text += f"{'='*80}\n\n"
@@ -1066,13 +1284,13 @@ GUIDANCE: Contribute when your specific expertise can help answer their explicit
                 conversation_text = f"\n{'='*80}\n"
                 conversation_text += f"FULL CONVERSATION HISTORY\n"
                 conversation_text += f"(This includes your own previous contributions from prior phases)\n"
-                if is_chair:
-                    conversation_text += f"(You're seeing all messages including current Phase {current_phase} - you go last)\n"
+                if is_synthesis_specialist:
+                    conversation_text += f"(You're seeing all messages including current Phase {current_phase} - you synthesize after others speak)\n"
                 else:
                     conversation_text += f"(Specialist messages from current Phase {current_phase} not yet visible)\n"
                 conversation_text += f"{'='*80}\n\n"
             
-            # Process messages with optional compression AND current phase filtering (except for Chair)
+            # Process messages with optional compression AND current phase filtering (except for synthesis specialists)
             first_msg = True
             for i, msg in enumerate(history_messages):
                 speaker = msg.name if hasattr(msg, 'name') and msg.name else "Unknown"
@@ -1100,20 +1318,20 @@ GUIDANCE: Contribute when your specific expertise can help answer their explicit
                 # Always show User and Notice
                 if speaker == "User" or speaker == "Notice":
                     visible = True
-                # Filter out current phase specialist messages (atomic phases) - but Chair sees them
-                elif msg_phase >= current_phase and not is_chair:
+                # Filter out current phase specialist messages (atomic phases) - but synthesis specialists see them
+                elif msg_phase >= current_phase and not is_synthesis_specialist:
                     visible = False
                 # Filter Search tool results - only visible for single phase (conserve tokens)
                 # Search results are ephemeral: visible for 1 phase, then hidden
                 elif speaker == "Search tool":
-                    # For Chair: keep current phase (N) only
-                    # For specialists: keep previous phase (N-1) only (they don't see current)
-                    if is_chair:
-                        # Chair sees current phase search results only
+                    # For synthesis specialists: keep current phase (N) only
+                    # For regular specialists: keep previous phase (N-1) only (they don't see current)
+                    if is_synthesis_specialist:
+                        # Synthesis specialists see current phase search results only
                         if msg_phase != current_phase:
                             visible = False  # Hide search results not from current phase
                     else:
-                        # Specialists see previous phase search results only
+                        # Regular specialists see previous phase search results only
                         if msg_phase != current_phase - 1:
                             visible = False  # Hide search results not from immediately previous phase
                 # Apply rate-limit compression if exists (overrides normal compression)
@@ -1144,13 +1362,13 @@ GUIDANCE: Contribute when your specific expertise can help answer their explicit
             
             conversation_text += f"{'='*80}\n"
             if compress:
-                if is_chair:
-                    conversation_text += f"END OF COMPRESSED HISTORY (including current phase - you go last)\n"
+                if is_synthesis_specialist:
+                    conversation_text += f"END OF COMPRESSED HISTORY (including current phase - you synthesize after others)\n"
                 else:
                     conversation_text += f"END OF COMPRESSED HISTORY (PRIOR PHASES ONLY)\n"
             else:
-                if is_chair:
-                    conversation_text += f"END OF CONVERSATION HISTORY (including current phase - you go last)\n"
+                if is_synthesis_specialist:
+                    conversation_text += f"END OF CONVERSATION HISTORY (including current phase - you synthesize after others)\n"
                 else:
                     conversation_text += f"END OF CONVERSATION HISTORY (PRIOR PHASES ONLY)\n"
             conversation_text += f"{'='*80}\n"
@@ -1158,6 +1376,11 @@ GUIDANCE: Contribute when your specific expertise can help answer their explicit
                 debug_output_buffer.append(f"{'='*80}\n")
             
             messages.append(HumanMessage(content=conversation_text))
+            
+            # Add active graph context (if graph exists)
+            graph_context = build_active_graph_context()
+            if graph_context:
+                messages.append(HumanMessage(content=graph_context))
         else:
             messages.append(HumanMessage(content="\n[No conversation history yet]\n"))
         
@@ -1396,21 +1619,21 @@ GUIDANCE FOR PHASE 3+ NATURAL DISCUSSION:
         
         # Determine self-awareness and history visibility based on phase
         current_phase_check = state.get("phase_number", 1)
-        is_chair_check = (name == "Chair")
+        is_synthesis_specialist_check = (name in SYNTHESIS_SPECIALISTS)
         
         if current_phase_check == 1:
             history_visibility = "NO - Fresh independent response"
             self_awareness = "NO - No history available"
         elif current_phase_check == 2 or is_final:
-            if is_chair_check and not is_final:
-                history_visibility = "YES - Sees Phase 1 AND current phase (goes last)"
+            if is_synthesis_specialist_check and not is_final:
+                history_visibility = "YES - Sees Phase 1 AND current phase (synthesizes after others)"
                 self_awareness = "NO - Only sees OTHER specialists' messages (own Phase 1 filtered)"
             else:
                 history_visibility = "YES - Sees PRIOR phase history only (Phase 1)"
                 self_awareness = "NO - Only sees OTHER specialists' messages (own filtered out, current phase filtered)"
         else:
-            if is_chair_check:
-                history_visibility = "YES - Sees all prior phases AND current phase (goes last)"
+            if is_synthesis_specialist_check:
+                history_visibility = "YES - Sees all prior phases AND current phase (synthesizes after others)"
                 self_awareness = "YES - Sees own previous contributions from PRIOR phases + others (incl current phase)"
             else:
                 history_visibility = "YES - Sees PRIOR phases history only (current phase filtered)"
@@ -1560,6 +1783,30 @@ GUIDANCE FOR PHASE 3+ NATURAL DISCUSSION:
                         print(f"{white(f'[{human_timestamp}]')} {cyan('Notice:')} {light_green(notice_text)}\n", flush=True)
                         print(f"📝 Adding 'back to discussion' Notice to conversation history", 
                               file=sys.stderr, flush=True)  # stderr
+                
+            except BadRequestError as e:
+                # 400 error - OpenAI refused the prompt (likely content policy violation)
+                # Log the full context for analysis and continue gracefully
+                with _console_output_lock:
+                    print(f"\n{'='*80}", file=sys.stderr)
+                    print(red(f"⚠️  400 BAD REQUEST from OpenAI for {name}"), file=sys.stderr)
+                    print(red(f"Error: {str(e)}"), file=sys.stderr)
+                    print(f"This may be a content policy violation.", file=sys.stderr)
+                    print(f"Logging full context to 400s.log for analysis...", file=sys.stderr)
+                    print(f"⚠️  Continuing with other specialists (not halting execution)", file=sys.stderr)
+                    print(f"{'='*80}\n", file=sys.stderr)
+                    sys.stderr.flush()
+                
+                # Log the denied request for analysis
+                log_denied_request(name, messages, e)
+                
+                # Return a synthetic "pass" message instead of crashing
+                error_message = AIMessage(
+                    content=f"@[All] I encountered a content policy issue and cannot respond. (Error logged to 400s.log)",
+                    name=name,
+                    additional_kwargs={"phase": state.get("phase_number", 1)}
+                )
+                return {"messages": [error_message]}
                 
             except Exception as e:
                 # Other errors - don't retry, just raise
@@ -1754,8 +2001,6 @@ def get_mentioned_available_specialists(state: OverallState) -> list[str]:
     Returns:
         List of role_keys for available specialists who were mentioned
     """
-    import re
-    
     current_phase = state.get("phase_number", 1)
     presence = state.get("specialist_presence", {})
     
@@ -1806,7 +2051,6 @@ def check_discussion_stagnation(state: OverallState, current_synthesis: str, cur
             - stagnated: bool (True if stagnated, False if still progressing)
             - notice: AIMessage if stagnated (to announce final round)
     """
-    import re
     from langchain_core.messages import SystemMessage, HumanMessage
     
     history_messages = state.get("messages", [])
@@ -2497,8 +2741,8 @@ yes = stagnated (move to final round and provide concluding assessments)
 no = still progressing (continue discussion)
 """
     
-    # Create LLM instance for stagnation check
-    llm = get_llm("Chair", config.chair)
+    # Create LLM instance for stagnation check with phase-specific settings
+    llm = get_llm("Chair", config.chair, phase_number=current_phase)
     
     # Build messages
     messages = [
@@ -2564,6 +2808,23 @@ no = still progressing (continue discussion)
                 
                 return {"stagnated": False}
     
+    except BadRequestError as e:
+        # 400 error - OpenAI refused the prompt (likely content policy violation)
+        # Log the full context for analysis but don't retry
+        with _console_output_lock:
+            print(yellow(f"[CHAIR] ❌ Stagnation check REFUSED by OpenAI (400 error)"), file=sys.stderr)
+            print(yellow(f"[CHAIR] Error: {e}"), file=sys.stderr)
+            print(yellow(f"[CHAIR] This may be a content policy violation."), file=sys.stderr)
+            print(yellow(f"[CHAIR] Logging full context to 400s.log for analysis..."), file=sys.stderr)
+            print(yellow(f"[CHAIR] Continuing discussion without stagnation detection\n"), file=sys.stderr)
+            sys.stderr.flush()
+        
+        # Log the denied request for analysis
+        log_denied_request("Chair (stagnation check)", messages, e)
+        
+        # Don't block discussion - default to not stagnated
+        return {"stagnated": False}
+    
     except Exception as e:
         # If stagnation check fails, don't block the discussion
         with _console_output_lock:
@@ -2601,15 +2862,40 @@ def chair_agent(state: OverallState) -> dict:
     current_phase = state.get("phase_number", 1)
     is_chair = True
     
-    # Chair skips Phase 1 - no synthesis needed yet
-    # Chair's functions (synthesis, on-topic enforcement, conflict resolution) 
-    # all require seeing specialist responses from PRIOR phases
-    # In Phase 1, specialists are isolated (see only User), so no synthesis/coordination needed
+    # Phase 1: Chair participates to monitor for duplicate graph paths
+    # Chair watches specialist proposals and marks duplicates early before branches form
+    # No synthesis needed yet, but duplicate marking is critical
+    phase_1_system_addition = ""
     if current_phase == 1:
-        with _console_output_lock:
-            print(yellow(f"[CHAIR] Skipping Phase 1 - no synthesis needed (specialists in isolated assessment)\n"), file=sys.stderr)
-            sys.stderr.flush()
-        return {"messages": []}  # No-op, don't add Chair message
+        # Chair needs special Phase 1 system prompt focusing on duplicate detection
+        phase_1_system_addition = """
+
+🔥 PHASE 1 - YOUR SPECIFIC ROLE:
+
+In Phase 1, specialists are providing their independent assessments. Your role is LIMITED but CRITICAL:
+
+**PRIMARY FOCUS: Watch for duplicate graph paths**
+- Specialists may independently propose similar graph questions/answers with different wording
+- Mark duplicates IMMEDIATELY using `[🧹][canonical path][comment]` syntax
+- Keep the first proposed path as canonical, mark later duplicates
+- This prevents vote fragmentation before it starts
+
+**DO NOT DO in Phase 1:**
+- ❌ Don't synthesize (no synthesis needed - specialists haven't seen each other yet)
+- ❌ Don't provide general commentary
+- ❌ Don't enforce on-topic (specialists are addressing User's request directly)
+- ❌ Don't table debates (no cross-specialist debates in Phase 1)
+
+**ONLY OUTPUT if you spot duplicate graph paths** - otherwise remain silent (pass).
+
+**Example Phase 1 output (ONLY if duplicates detected):**
+```
+@[All] I notice duplicate graph proposals:
+@[Graph][Update][Q:single][What is approach?][A][Phased rollout][🧹][Q:single][What is approach?][A][Phased deployment][Duplicate - "Phased deployment" was proposed first]
+```
+
+If no duplicates detected: Simply respond with "I have no further comments at this time" (pass).
+"""
     
     # Phase 2+: Count specialist responses to ensure there's material to synthesize
     specialist_count = 0
@@ -2653,9 +2939,12 @@ def chair_agent(state: OverallState) -> dict:
     if additional_notices:
         modified_state["messages"] = list(state.get("messages", [])) + additional_notices
     
-    # Otherwise, proceed normally - Chair has material to synthesize
+    # Build Chair's system prompt (with Phase 1 addition if applicable)
+    chair_system_prompt = CHAIR_SYSTEM + phase_1_system_addition
+    
+    # Invoke Chair with appropriate system prompt
     # Status message now printed inside agent function just before LLM call
-    result = create_agent_func("Chair", CHAIR_SYSTEM, config.chair, specialist_count)(modified_state)
+    result = create_agent_func("Chair", chair_system_prompt, config.chair, specialist_count)(modified_state)
     
     # If we added notices, include them in the output
     if additional_notices:
@@ -3010,6 +3299,7 @@ async def execute_phase_parallel(state: OverallState) -> dict:
     # Deduplicate and track which specialists requested each
     search_requests = {}  # query -> [specialist_names]
     readurl_requests = {}  # url -> [specialist_names]
+    graph_operations = []  # [(specialist_name, content)]
     
     for msg in specialist_messages:
         if hasattr(msg, 'name') and msg.name:
@@ -3035,6 +3325,11 @@ async def execute_phase_parallel(state: OverallState) -> dict:
                         readurl_requests[url_normalized] = []
                     if specialist_name not in readurl_requests[url_normalized]:
                         readurl_requests[url_normalized].append(specialist_name)
+            
+            # Extract Graph operations
+            graph_requests = detect_graph_requests(content)
+            if graph_requests:
+                graph_operations.append((specialist_name, content, graph_requests))
     
     # Process unique search queries (deduplicated)
     tool_messages = []
@@ -3069,6 +3364,47 @@ async def execute_phase_parallel(state: OverallState) -> dict:
             )
             tool_messages.append(readurl_message)
     
+    # Process Graph operations from all specialists
+    # Logs @[Graph][Create] and @[Graph][Update] operations to graph.log
+    graph_create_operations = []  # Collect Create operations for Chair de-dupe pass
+    
+    if graph_operations:
+        print(f"[DEBUG] Phase {current_phase} - Processing Graph operations from {len(graph_operations)} specialists", file=sys.stderr)
+        for specialist_name, content, requests in graph_operations:
+            print(f"[DEBUG]   Processing Graph operations from {specialist_name}", file=sys.stderr)
+            
+            # Collect Create operations that aren't already marked as duplicates
+            for req in requests:
+                if req.get('operation') == 'Create' and '[🧹]' not in req.get('raw', ''):
+                    # Extract path to get vote counts and user thoughts
+                    from .graph_tool import extract_path_from_content
+                    path = extract_path_from_content(req['raw'].replace('@[Graph][Create]', ''))
+                    
+                    # Get vote tally from graph_parser analysis
+                    vote_count = 0
+                    user_thoughts_count = 0
+                    
+                    # We'll need to analyze graph.log to get current vote counts
+                    # For now, just track the path
+                    graph_create_operations.append({
+                        'specialist': specialist_name,
+                        'raw': req['raw'],
+                        'content': content,
+                        'path': path
+                    })
+            
+            graph_messages = process_graph_operations(
+                message_content=content,
+                requester_name=specialist_name,
+                phase=current_phase
+            )
+            if graph_messages:
+                # Add timestamp and phase to graph response messages
+                timestamp = datetime.now().astimezone().isoformat(timespec='milliseconds')
+                for msg in graph_messages:
+                    msg.additional_kwargs = {"phase": current_phase, "timestamp": timestamp}
+                tool_messages.extend(graph_messages)
+    
     # Add tool messages to all_messages (before Chair executes)
     all_messages.extend(tool_messages)
     
@@ -3079,6 +3415,10 @@ async def execute_phase_parallel(state: OverallState) -> dict:
         # Update state with all specialist messages for Chair to synthesize
         state_with_specialists["messages"] = state.get("messages", []) + specialist_messages
     
+    # Add tool messages to state for Chair to see
+    if tool_messages:
+        state_with_specialists["messages"] = state_with_specialists.get("messages", []) + tool_messages
+    
     # Chair executes only after all specialists have completed
     chair_result = await invoke_agent_async(chair_agent, state_with_specialists, semaphore)
     
@@ -3088,13 +3428,230 @@ async def execute_phase_parallel(state: OverallState) -> dict:
         chair_messages = chair_result["messages"]
         all_messages.extend(chair_messages)
     
+    # CHAIR DE-DUPE PASS: After Chair's normal synthesis, run de-dupe pass on Create operations
+    # This happens at the end of each phase to mark duplicate paths WITHIN THE PHASE
+    # Scope: Only compares Creates from this phase (specialists ran in parallel, can't see each other)
+    if graph_create_operations:
+        print(f"\n{'='*80}", file=sys.stderr)
+        print(f"🧹 CHAIR DE-DUPE PASS: Reviewing {len(graph_create_operations)} @[Graph][Create] operations from Phase {current_phase}", file=sys.stderr)
+        print(f"{'='*80}", file=sys.stderr)
+        
+        # Analyze current graph state to get vote counts and user thoughts
+        from graph_parser import analyze_graph_log
+        try:
+            nodes, vote_tally, specialist_stats = analyze_graph_log('graph.log')
+            
+            # Enrich Create operations with vote counts, user thoughts, and user selections
+            for op in graph_create_operations:
+                path = op.get('path', '')
+                if path in vote_tally:
+                    op['votes'] = vote_tally[path].get('upvotes', 0)
+                    op['downvotes'] = vote_tally[path].get('downvotes', 0)
+                else:
+                    op['votes'] = 0
+                    op['downvotes'] = 0
+                
+                if path in nodes and 'user_thoughts' in nodes[path]:
+                    op['user_thoughts'] = len(nodes[path]['user_thoughts'])
+                else:
+                    op['user_thoughts'] = 0
+                
+                # Check for user selections/dismissals on this path
+                op['user_selected'] = False
+                op['user_dismissed'] = False
+                if path in nodes and 'votes' in nodes[path]:
+                    for vote_record in nodes[path]['votes']:
+                        if vote_record.get('vote') == '✅':
+                            op['user_selected'] = True
+                        elif vote_record.get('vote') == '❌':
+                            op['user_dismissed'] = True
+        except Exception as e:
+            print(f"Warning: Could not enrich Create operations with vote data: {e}", file=sys.stderr)
+            # Add defaults if enrichment failed
+            for op in graph_create_operations:
+                if 'votes' not in op:
+                    op['votes'] = 0
+                if 'downvotes' not in op:
+                    op['downvotes'] = 0
+                if 'user_thoughts' not in op:
+                    op['user_thoughts'] = 0
+                if 'user_selected' not in op:
+                    op['user_selected'] = False
+                if 'user_dismissed' not in op:
+                    op['user_dismissed'] = False
+        
+        # Log what we're handing to Chair
+        print(f"\nHanding to Chair for review:", file=sys.stderr)
+        for i, op in enumerate(graph_create_operations, 1):
+            print(f"  {i}. [{op['specialist']}] {op['raw'][:80]}... (👍{op.get('votes', 0)} 👎{op.get('downvotes', 0)} 💭{op.get('user_thoughts', 0)})", file=sys.stderr)
+        print(file=sys.stderr)
+        
+        # Build dedupe prompt with ONLY graph paths (no user context - causes objective contamination)
+        dedupe_prompt = CHAIR_DEDUPE_PASS_SYSTEM + "\n\n"
+        dedupe_prompt += "# Graph Paths Created This Phase:\n\n"
+        for i, op in enumerate(graph_create_operations, 1):
+            votes = op.get('votes', 0)
+            downvotes = op.get('downvotes', 0)
+            thoughts = op.get('user_thoughts', 0)
+            user_selected = op.get('user_selected', False)
+            user_dismissed = op.get('user_dismissed', False)
+            
+            # Build state indicators
+            state_indicators = f"👍{votes} 👎{downvotes}"
+            if user_selected:
+                state_indicators += " ✅"
+            if user_dismissed:
+                state_indicators += " ❌"
+            if thoughts > 0:
+                state_indicators += f" 💭{thoughts}"
+            
+            dedupe_prompt += f"{i}. [{op['specialist']}] {op['raw']}\n"
+            dedupe_prompt += f"   Current state: {state_indicators}\n"
+        
+        dedupe_prompt += "\n" + "="*80 + "\n"
+        dedupe_prompt += "END OF DATA INPUT\n"
+        dedupe_prompt += "="*80 + "\n\n"
+        dedupe_prompt += "REMINDER: You are a GRAPH PATH ANALYZER, not a conversational assistant.\n"
+        dedupe_prompt += "Your response must be ONLY de-duplication commands or 'No duplicates found.'\n"
+        dedupe_prompt += "Do NOT provide any other text.\n\n"
+        dedupe_prompt += "Output your de-duplication analysis now:"
+        
+        # Log de-dupe session to chair-dedupe.log
+        dedupe_log_path = "chair-dedupe.log"
+        try:
+            with open(dedupe_log_path, 'a', encoding='utf-8') as dedupe_log:
+                dedupe_log.write(f"\n{'='*80}\n")
+                dedupe_log.write(f"PHASE {current_phase} DE-DUPE PASS - {datetime.now().astimezone().isoformat()}\n")
+                dedupe_log.write(f"{'='*80}\n\n")
+                
+                # Section 1: Full LLM prompt sent to Chair
+                dedupe_log.write(f"[1] FULL PROMPT SENT TO LLM:\n\n")
+                dedupe_log.write(dedupe_prompt)
+                dedupe_log.write(f"\n\n{'-'*80}\n\n")
+                
+                # Section 2: Create operations being reviewed (for quick reference)
+                dedupe_log.write(f"[2] CREATE OPERATIONS BEING REVIEWED ({len(graph_create_operations)} total):\n\n")
+                for i, op in enumerate(graph_create_operations, 1):
+                    dedupe_log.write(f"{i}. [{op['specialist']}] {op['raw']}\n")
+                dedupe_log.write(f"\n{'-'*80}\n\n")
+        except Exception as e:
+            print(f"Warning: Could not write to {dedupe_log_path}: {e}", file=sys.stderr)
+        
+        # Create temporary state with all messages so far for Chair to see
+        state_for_dedupe = dict(state)
+        state_for_dedupe["messages"] = state.get("messages", []) + all_messages
+        
+        # Invoke Chair with de-dupe prompt
+        dedupe_agent = create_agent_func("Chair", dedupe_prompt, config.chair)
+        dedupe_result = await invoke_agent_async(dedupe_agent, state_for_dedupe, semaphore)
+        
+        if "messages" in dedupe_result and dedupe_result["messages"]:
+            dedupe_messages = dedupe_result["messages"]
+            print(f"\nChair de-dupe pass response ({len(dedupe_messages)} message(s)):", file=sys.stderr)
+            
+            # Log Chair's response and count duplicates found
+            duplicates_marked = 0
+            for msg in dedupe_messages:
+                if hasattr(msg, 'content'):
+                    content_preview = msg.content[:200].replace('\n', ' ')
+                    print(f"  Chair: {content_preview}{'...' if len(msg.content) > 200 else ''}", file=sys.stderr)
+                    duplicates_marked += msg.content.count('[🧹]')
+            
+            print(f"\n🧹 Duplicates marked by Chair: {duplicates_marked}", file=sys.stderr)
+            
+            # Log Chair's response to chair-dedupe.log
+            try:
+                with open(dedupe_log_path, 'a', encoding='utf-8') as dedupe_log:
+                    dedupe_log.write(f"[3] RAW LLM RESPONSE FROM CHAIR:\n\n")
+                    for msg in dedupe_messages:
+                        if hasattr(msg, 'content'):
+                            dedupe_log.write(msg.content)
+                            dedupe_log.write("\n\n")
+                    dedupe_log.write(f"{'-'*80}\n\n")
+                    
+                    # Section 4: Extract and show @[Graph][Update] operations Chair is broadcasting to room
+                    dedupe_log.write(f"[4] GRAPH OPERATIONS CHAIR BROADCAST TO ROOM:\n\n")
+                    graph_ops_found = 0
+                    for msg in dedupe_messages:
+                        if hasattr(msg, 'content'):
+                            # Find all @[Graph][Update] operations in Chair's response
+                            graph_updates = re.findall(r'@\[Graph\]\[Update\][^\n]+', msg.content)
+                            if graph_updates:
+                                for update_op in graph_updates:
+                                    graph_ops_found += 1
+                                    dedupe_log.write(f"  {graph_ops_found}. {update_op}\n")
+                    
+                    if graph_ops_found == 0:
+                        dedupe_log.write("  (None - Chair found no duplicates)\n")
+                    
+                    dedupe_log.write(f"\n{'-'*80}\n")
+                    dedupe_log.write(f"SUMMARY: {duplicates_marked} duplicate(s) marked with [🧹]\n")
+                    dedupe_log.write(f"{'='*80}\n\n")
+            except Exception as e:
+                print(f"Warning: Could not write Chair response to {dedupe_log_path}: {e}", file=sys.stderr)
+            
+            all_messages.extend(dedupe_messages)
+            
+            # Process any @[Graph][Update][...][🧹][...] operations from Chair's de-dupe pass
+            processed_graph_msgs = []
+            for msg in dedupe_messages:
+                if hasattr(msg, 'content'):
+                    dedupe_graph_msgs = process_graph_operations(
+                        message_content=msg.content,
+                        requester_name="Chair",
+                        phase=current_phase
+                    )
+                    if dedupe_graph_msgs:
+                        # Add proper timestamp and phase to graph tool messages
+                        dedupe_timestamp = datetime.now().astimezone().isoformat(timespec='milliseconds')
+                        for graph_msg in dedupe_graph_msgs:
+                            graph_msg.additional_kwargs = {"phase": current_phase, "timestamp": dedupe_timestamp}
+                        
+                        processed_graph_msgs.extend(dedupe_graph_msgs)
+                        all_messages.extend(dedupe_graph_msgs)
+            
+            # Log what got added to the room after processing
+            try:
+                with open(dedupe_log_path, 'a', encoding='utf-8') as dedupe_log:
+                    dedupe_log.write(f"[5] MESSAGES ADDED TO ROOM AFTER PROCESSING:\n\n")
+                    if processed_graph_msgs:
+                        for i, graph_msg in enumerate(processed_graph_msgs, 1):
+                            if hasattr(graph_msg, 'content'):
+                                dedupe_log.write(f"{i}. [{graph_msg.name if hasattr(graph_msg, 'name') else 'Unknown'}]\n")
+                                dedupe_log.write(f"   {graph_msg.content[:300]}{'...' if len(graph_msg.content) > 300 else ''}\n\n")
+                    else:
+                        dedupe_log.write("  (None - no Graph tool acknowledgment messages generated)\n")
+                    dedupe_log.write(f"\n{'='*80}\n\n")
+            except Exception as e:
+                print(f"Warning: Could not write final section to {dedupe_log_path}: {e}", file=sys.stderr)
+        else:
+            print(f"\nChair de-dupe pass: No response (Chair may have passed or returned empty)", file=sys.stderr)
+            
+            # Log "no response" to chair-dedupe.log
+            try:
+                with open(dedupe_log_path, 'a', encoding='utf-8') as dedupe_log:
+                    dedupe_log.write(f"[3] RAW LLM RESPONSE FROM CHAIR:\n\n")
+                    dedupe_log.write(f"(No messages returned - Chair may have found no duplicates)\n\n")
+                    dedupe_log.write(f"{'-'*80}\n\n")
+                    dedupe_log.write(f"[4] GRAPH OPERATIONS CHAIR BROADCAST TO ROOM:\n\n")
+                    dedupe_log.write(f"  (None)\n\n")
+                    dedupe_log.write(f"{'-'*80}\n")
+                    dedupe_log.write(f"SUMMARY: 0 duplicate(s) marked\n")
+                    dedupe_log.write(f"{'='*80}\n\n")
+            except Exception as e:
+                print(f"Warning: Could not write to {dedupe_log_path}: {e}", file=sys.stderr)
+        
+        print(f"\n{'='*80}", file=sys.stderr)
+        print(f"✅ DE-DUPE PASS COMPLETE", file=sys.stderr)
+        print(f"{'='*80}\n", file=sys.stderr)
+    
     # CRITICAL: Collect Chair's specialist_presence update (if any)
     # Chair may bring new specialists into the room, so we must propagate this state change
     # to the next phase. Without this, added specialists won't appear in agents_remaining.
     chair_presence_update = chair_result.get("specialist_presence")
     
     # Auto-dismiss non-core specialists who responded
-    # This happens AFTER Chair's additions, so newly added specialists aren't immediately dismissed
+    # This happens AFTER Chair's synthesis AND de-dupe pass, so newly added specialists aren't immediately dismissed
     # Create a temporary state with Chair's presence updates applied
     state_for_dismiss = dict(state)
     if chair_presence_update is not None:
@@ -3105,7 +3662,7 @@ async def execute_phase_parallel(state: OverallState) -> dict:
     dismiss_presence_update, dismiss_notices = auto_dismiss_non_core_specialists(
         specialist_messages,  # Only specialist messages (before Chair)
         state_for_dismiss,    # State with Chair's additions already applied
-        chair_messages        # Chair messages to check for mentions
+        chair_messages        # Chair messages to check for mentions (from synthesis, not de-dupe)
     )
     
     # Combine presence updates: Chair's additions first, then auto-dismissals

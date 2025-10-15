@@ -23,3 +23,9 @@ __pycache__/
 .axion_checkpoint.json
 .axion_checkpoint.tmp
 *.cast
+
+# Logs
+chair-dedupe.log
+graph.log
+user_input.txt
+

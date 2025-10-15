@@ -1,0 +1,141 @@
+Graph Tool: Create vs Update Split + Automated De-Duplication
+
+Major refactor of @[Graph] tool to separate node creation from voting, with
+automated Chair-led duplicate detection at end of each phase.
+
+PROBLEM:
+- Specialists were using @[Graph][Update] for both creating AND voting
+- Massive duplication: every specialist re-created same Q->A pairs to vote
+- Example: Same question+answer created in Phase 1, then again by 3 specialists
+  in Phase 2 just to add their votes
+- Vote fragmentation across semantically identical paths
+- No validation preventing duplicate Creates
+
+SOLUTION - CREATE VS UPDATE SPLIT:
+
+1. Backend (graph_tool.py):
+   - Added @[Graph][Create] operation type for proposing NEW path segments
+   - Added @[Graph][Update] for voting on EXISTING complete paths
+   - Global _created_paths set tracks all created paths
+   - Validation: Create rejects if path exists, Update rejects if doesn't exist
+   - Exception: question-only and rationale-only Updates allowed
+   - Added load_existing_paths_from_log(), extract_path_from_content()
+   - Added normalize_text() for duplicate detection
+   - Added get_existing_paths_summary() for specialist context
+
+2. Chair Automated De-Dupe Pass (agents.py):
+   - Runs at end of each phase after Chair's normal synthesis
+   - Collects all @[Graph][Create] from THAT PHASE ONLY
+   - Filters out already-marked duplicates ([🧹] in raw)
+   - Analyzes graph.log to enrich with vote counts + user thoughts
+   - Provides Chair with full context:
+     * User messages (all phases)
+     * User graph interactions (selections, dismissals, thoughts from Web UI)
+     * Create operations with vote/thought counts
+   - Invokes Chair with dedicated CHAIR_DEDUPE_PASS_SYSTEM prompt
+   - Chair compares within-phase Creates for semantic duplicates
+   - Chair outputs @[Graph][Update][dup][🧹][canonical] commands
+   - Processes Chair's duplicate markers and logs to graph.log
+   - Comprehensive logging to chair-dedupe.log:
+     [1] Full LLM prompt sent to Chair
+     [2] Create operations being reviewed
+     [3] Raw LLM response from Chair
+     [4] Graph operations Chair broadcast to room
+     [5] Messages added to room after processing
+   - Added imports: CHAIR_DEDUPE_PASS_SYSTEM, extract_path_from_content
+
+3. Chair De-Dupe Prompt (prompts.py):
+   - New CHAIR_DEDUPE_PASS_SYSTEM with laser-focused task
+   - Explicit: "DO NOT respond to user, DO NOT provide synthesis"
+   - Chair's job: Output @[Graph][Update][...][🧹][...] commands ONLY
+   - Smart canonical selection with weighted priorities:
+     Priority 1: User thoughts (💭 count) - highest
+     Priority 2: Net vote score (👍 - 👎) - very high
+     Priority 3: Graph structure position - high (Chair's judgment)
+     Priority 4: First occurrence - tie-breaker
+   - Considers user language/terminology for better matches
+   - Scope: Compares Create operations from current phase only
+   - Rationale: Specialists run in parallel, can't see each other
+
+4. Specialist Prompts (prompts.py):
+   - BASE_INSTRUCTION teaches Create vs Update distinction
+   - Clear rule: new segment = Create, voting = Update
+   - All emoji actions ([👍][👎][✅][❌][➖][🧹]) use Update
+   - Updated all examples: Create for proposals, Update for votes
+   - Duplicate handling: neutral redirect, not negative judgment
+   - Migrate votes/nodes from duplicates to canonical paths
+   - Never pursue, extend, or cite duplicate paths
+   - Added section: "EVERY GRAPH NODE MUST ADD VALUE"
+   - Guidance: Never echo/restate user's question
+   - Graph questions must be SPECIFIC DECISION POINTS
+   - Break down user question into concrete choices
+   - Context specialist updated with Create→Update pattern
+   - Removed test-case examples (pet sitter, deployment, phased rollout)
+   - All examples now generic (Option A/B, Approach X, etc.)
+   - Removed arbitrary ranges ("2-4 key questions" → "key decision points")
+
+5. Frontend Parser (graph_parser.py):
+   - Updated regex to match both Create and Update operations
+   - Handles @[Graph][Create] and @[Graph][Update] in graph.log
+   - No structural changes needed (both create same node structure)
+
+6. Web UI Duplicate Handling (QuestionNode.vue):
+   - Added isDuplicate() and getCanonicalPath() functions
+   - Visual treatment for duplicates:
+     * 35% opacity (darker than before - 30% more reduction)
+     * Darker gray background (#e2e8f0)
+     * 50% grayscale filter
+     * Strike-through text
+     * 🧹 inline indicator with tooltip
+   - Disabled interactions:
+     * Input disabled (can't select checkboxes/radios)
+     * No ❌ dismiss button shown
+     * No 💭 add thought button shown
+     * pointer-events: none on wrapper
+   - Allowed interaction:
+     * Can still expand/collapse (only interaction permitted)
+     * pointer-events: auto on question-header and expand-icon
+   - Tooltips show canonical path on hover
+   - Functions properly exported in return statement
+
+7. Web UI Hide Toggle (App.vue):
+   - Added hideDuplicates ref(false) state
+   - Slide toggle in sidebar above Statistics panel
+   - Modern toggle switch UI with smooth animation
+   - Filters duplicates from rootQuestions when enabled
+   - Props passed to QuestionNode: voteTally, hideDuplicates
+   - isDuplicateNode() function to check vote_tally
+
+8. Documentation (ARCHITECTURE.md):
+   - Updated all graph tool examples to use Create vs Update
+   - Documented Chair's de-dupe pass workflow
+   - Explained Create (new segment) vs Update (voting) semantics
+   - Updated duplicate handling section with new workflow
+   - Migration examples show Create for new nodes, Update for votes
+   - Clarified scope: within-phase comparison only
+
+BENEFITS:
+- Eliminates structural duplication (specialists Create once, Update to vote)
+- Automatic semantic duplicate detection (same meaning, different wording)
+- Smart canonical selection (user context + votes + structure)
+- Clean Web UI (duplicates clearly marked and non-interactive)
+- Complete audit trail (chair-dedupe.log shows everything)
+- Prevents vote fragmentation
+- Domain-agnostic system (no test-case examples in prompts)
+
+FILES MODIFIED:
+- axion_swarm/graph_tool.py: Create/Update split, validation, path tracking
+- axion_swarm/agents.py: De-dupe pass, user context collection, logging
+- axion_swarm/prompts.py: Create vs Update teaching, de-dupe prompt, generic examples
+- graph_parser.py: Parse both Create and Update operations
+- web/src/components/QuestionNode.vue: Duplicate detection, visual treatment, disabled interactions
+- web/src/App.vue: Hide duplicates toggle, filtering logic
+- ARCHITECTURE.md: Updated graph tool documentation
+- README.md: Documented Create vs Update split and de-dupe features
+
+TESTING:
+- Detection and path extraction tests pass
+- Create/Update validation requires real swarm run
+- Web UI loads without errors
+- Defensive checks prevent undefined voteTally crashes
+

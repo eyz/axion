@@ -60,6 +60,14 @@
   - [Logging Architecture](#logging-architecture)
   - [Phase Blocking & Notice Refinements](#phase-blocking--notice-refinements-2025-10-15-late-session)
 
+### Web Interface (2025-10-25)
+- [Web Interface Overview](#web-interface-overview-2025-10-25)
+  - [TUI to Web Transition](#tui-to-web-transition)
+  - [Three Interface Implementations](#three-interface-implementations)
+  - [Real-Time Architecture](#real-time-architecture)
+  - [Cascading Selection](#cascading-selection)
+  - [Sacred User State](#sacred-user-state)
+
 ### Cloud Provider Integration
 - [Azure OpenAI Integration (2025-01-09)](#azure-openai-integration-2025-01-09)
   - [Rate Limit Handling](#rate-limit-handling-2025-01-09)
@@ -73,6 +81,461 @@
 - [Debugging Guide](#debugging-guide)
 - [Files Reference](#files-reference)
 - [Potential Enhancements](#potential-enhancements)
+  - [Neo4j Backend with Interactive Node Disambiguation](#neo4j-backend-with-interactive-node-disambiguation-future-enhancement)
+  - [Cloud Provider Parallelization](#cloud-provider-parallelization-future-improvement)
+
+---
+
+## Recent Development History
+
+### Critical Bug Fixes: Chair Deduplication + Web UI Reactivity (Nov 2, 2025 - Late Session)
+
+**Production Crisis Resolved**: Chair's deduplication LLM hallucinated catastrophically, marking ALL 25 answers as "duplicates of their parent questions" and triggering auto-clear of all user selections. This session documents the root cause analysis, validation fixes, and reactivity improvements.
+
+**1. Chair Deduplication Hallucination - Validation Guard System**
+
+**Problem Discovered** (`chair-dedupe.log` lines 435-461):
+- Chair's LLM output in Phase 2 marked every answer as duplicate of its parent question:
+  ```
+  @[Graph][Update][Q:multiple][What authority...][A][Authorize vet care...][🧹][Q:multiple][What authority...]
+  ```
+- This is nonsensical: an answer CANNOT be a duplicate of its parent question
+- Result: All 25 answers disappeared from UI, auto-clear removed 12 user selections
+- Chair should have output "No duplicates found." - this was complete LLM hallucination
+
+**Root Cause Analysis**:
+1. Chair dedupe prompt lacked explicit validation rules preventing structural impossibilities
+2. No backend validation caught the invalid duplicate markers before processing
+3. Auto-clear mechanism executed blindly on marked "duplicates" without sanity checks
+
+**Solution - Multi-Layer Validation** (`graph_tool.py` lines 488-538):
+
+Added comprehensive validation before processing Chair's duplicate markers:
+
+```python
+# Extract both duplicate and canonical paths
+duplicate_path = extract_path_from_content(before_broom)
+canonical_path = extract_path_from_content(after_broom)
+
+# VALIDATION: Reject nonsensical duplicate markers
+# Check 1: Duplicate and canonical must be DIFFERENT paths
+if duplicate_path == canonical_path:
+    rejection_reason = "Duplicate and canonical paths are identical"
+
+# Check 2: Answer cannot be duplicate of its parent question
+elif '[A]' in duplicate_path and '[A]' not in canonical_path:
+    if duplicate_path.startswith(canonical_path):
+        rejection_reason = "Answer cannot be marked as duplicate of its parent question"
+
+# Check 3: Question cannot be duplicate of its own answer
+elif '[A]' in canonical_path and '[A]' not in duplicate_path:
+    if canonical_path.startswith(duplicate_path):
+        rejection_reason = "Question cannot be marked as duplicate of its own answer"
+```
+
+**Prompt Enhancement** (`prompts.py` lines 3125-3141):
+
+Added explicit "CRITICAL VALIDATION RULES" section to Chair dedupe prompt:
+1. **NEVER mark an answer as duplicate of its parent question**
+2. **NEVER mark a question as duplicate of its own answer**
+3. **Duplicate and canonical must be DIFFERENT complete paths**
+4. **Only compare paths at the SAME STRUCTURAL LEVEL**
+
+Each rule includes WRONG examples showing the exact pattern to avoid.
+
+**Production Recovery**:
+- Removed 37 invalid lines from production `graph.log` (25 bad duplicate markers + 12 auto-clears)
+- Validated all 12 user selections still intact after cleanup
+- System now prevents this class of hallucination at backend validation layer
+
+**2. Viewport Pinning Hides New Questions**
+
+**Bug**: Questions added in Phase 2+ were counted as "pending" (button showed "2 pending") but completely invisible - viewport pinning froze display at Phase 1's 7 questions.
+
+**Root Cause** (`App.vue` lines 494-499):
+```javascript
+// OLD - Only showed pinned questions
+if (hasAnyInViewport && pinnedRootQuestionOrder.value) {
+  const result = pinnedRootQuestionOrder.value.filter(q => rootQuestions.value.includes(q))
+  return result  // New questions from Phase 2+ not included!
+}
+```
+
+**Fix** (`App.vue` lines 497-505):
+```javascript
+// NEW - Appends new questions to pinned order
+const pinnedStillExist = pinnedRootQuestionOrder.value.filter(q => rootQuestions.value.includes(q))
+const pinnedSet = new Set(pinnedStillExist)
+const newQuestions = rootQuestions.value.filter(q => !pinnedSet.has(q))
+const result = [...pinnedStillExist, ...newQuestions]
+console.log(`   Pinned result: ${result.length} questions (${pinnedStillExist.length} pinned + ${newQuestions.length} new)`)
+```
+
+**Result**: New questions from later phases now visible at bottom of list.
+
+**3. Modal Click-Through Prevention**
+
+**Bug**: "New Content Added" modal could be dismissed by clicking anywhere (backdrop or button), defeating the purpose of forcing user awareness.
+
+**Fix** (`App.vue` line 13):
+```vue
+<!-- OLD - Backdrop click dismissed modal -->
+<div v-if="showNewContentModal" class="new-content-overlay" @click="acknowledgeNewContent">
+
+<!-- NEW - Only button dismisses -->
+<div v-if="showNewContentModal" class="new-content-overlay">
+```
+
+**UX Improvement**: Users must explicitly click the styled "Acknowledge & Continue" button - prevents accidental dismissal while scrolling.
+
+**4. PENDING Badge Reactivity on Nested Questions**
+
+**Bug**: When user submitted nested question's answer (e.g., "How many references?"), the parent question's PENDING badge remained visible even though the nested question was now answered.
+
+**Root Cause** (`QuestionNode.vue` original lines 404-410):
+- Answer paths in `selectionsAtLastSubmit` stored as SHORT relative paths: `[A][References from recent clients]`
+- Code checked: `if (nodePath.startsWith(answerPath + '[Q:'))`
+- Full nested path: `[Q:multiple][What verification...][A][References...][Q:single][How many...]`
+- Short answer path: `[A][References...]`
+- **Never matched**: Full path doesn't start with `[A][References...]`!
+
+**Fix** (`QuestionNode.vue` line 406):
+```javascript
+// Build FULL answer path (answer paths in selections are SHORT, relative to parent question)
+const fullAnswerPath = props.path + answerPath
+
+// Now check with full path
+if (nodePath.startsWith(fullAnswerPath + '[Q:')) {
+```
+
+**Result**: PENDING badge now clears correctly when nested questions are answered, proper reactivity cascade through parent hierarchy.
+
+**Files Modified**: `axion_swarm/graph_tool.py`, `axion_swarm/prompts.py`, `web/src/App.vue`, `web/src/components/QuestionNode.vue`
+
+**Impact**: Production system now resilient against Chair LLM hallucinations, web UI properly shows all questions regardless of when added, modal UX prevents accidental dismissal, and PENDING badges track nested question state accurately.
+
+---
+
+### Web UI Phase Management + PENDING Badge System + Active Graph Context (Nov 2, 2025)
+
+**Major architectural shift**: Web UI now controls phase progression, with complete separation between backend (TUI) and frontend (webserver).
+
+**Backend/Frontend Architecture Clarification:**
+
+The system now has clear architectural roles:
+- **Backend** (`main_tui.py`): Runs LangGraph workflow, executes agents, makes LLM calls, manages conversation state
+- **Frontend** (`webserver.py`): Serves web UI, handles browser WebSockets, lightweight presentation layer
+- **IPC** (file-based, current MVP): 
+  - `graph.log` - Backend → Frontend (graph state updates)
+  - `user_input.txt` - Frontend → Backend (user decisions, continue signals)
+  - `phase_status.json` - Backend → Frontend (phase execution state)
+- **Future**: Direct WebSocket/REST connection between backend and frontend servers
+
+**Phase Management System (`web/src/App.vue`, `webserver.py`, `main_tui.py`):**
+
+1. **Phase Status Indicator** (web UI header):
+   - Reactive state tracking: `phaseStatus: { waiting: bool, currentPhase: int, isFinal: bool }`
+   - Visual states:
+     - ⏸️ "Phase X Complete - Waiting for Continue" (orange background `#fed7aa`)
+     - ▶️ "Phase X Running" (green background `#d1fae5`)
+     - 🏁 "Final Phase X Complete" (purple background `#ddd6fe`)
+   - Backend updates `phase_status.json` when:
+     - Phase starts (`start_phase` node) → `waiting: false, phase: N`
+     - Phase completes (`execute_phase` node) → `waiting: true`
+     - User clicks Continue → `waiting: false`
+   - Webserver watches file with inotify, broadcasts via `phase_status` WebSocket event
+
+2. **Continue to Next Phase Button**:
+   - Disabled when `phaseStatus.waiting = false` (phase actively running)
+   - Enabled when `phaseStatus.waiting = true` (system paused after phase)
+   - Dynamic badge:
+     - "⚠️ X pending" (orange) if unanswered questions exist
+     - "✅ All answered" (green) only when all answered AND submitted
+   - Sends `@[System][ContinuePhase]` command to `user_input.txt`
+   - TUI recognizes command and sets `waiting_for_input = false`, allowing next phase to start
+
+3. **TUI Simplification** (`main_tui.py`):
+   - **Removed**: Complex question-blocking logic from left sidebar
+   - **Changed**: Always pause after every phase (except final)
+   - **Simplified**: Single pause message directing users to web UI
+   - **Implementation**:
+     ```python
+     # Old: Complex blocking based on pending questions
+     if question_count > 0:
+         await self.pause_for_input()
+         while self.waiting_for_input:
+             await asyncio.sleep(0.1)
+     
+     # New: Always pause, user controls via web UI
+     await self.pause_for_input()
+     while self.waiting_for_input:
+         await asyncio.sleep(0.1)
+     ```
+
+**PENDING Badge System (`web/src/App.vue`, `web/src/components/QuestionNode.vue`):**
+
+1. **Purpose**: Show which questions need user engagement (selection or thought), distinct from NEW badge
+
+2. **Badge Characteristics**:
+   - Orange gradient background (`#f59e0b` to `#d97706`)
+   - Pulse animation (like NEW badge)
+   - Text: "PENDING"
+   - Appears next to NEW badge when both conditions met
+
+3. **Pending Logic** (mirrors `unansweredQuestionCount` recursive logic):
+   ```javascript
+   function isQuestionPending(questionPath) {
+     // Not pending if: dismissed, has submitted selection, OR has user thoughts
+     if (isNodeXed(questionPath)) return false
+     if (selectionsAtLastSubmit[questionPath]) return false
+     if (node.user_thoughts?.length > 0) return false
+     
+     // Check if ancestors have submitted selections (making this reachable)
+     // ... recursive ancestor check ...
+     
+     return true  // Reachable and unanswered
+   }
+   ```
+
+4. **Bubbling Behavior** (QuestionNode.vue):
+   ```javascript
+   const isPending = computed(() => {
+     // Check if THIS question OR descendants along answered paths are pending
+     const hasPendingInSubtree = (questionPath) => {
+       if (isQuestionPending(questionPath)) return true
+       
+       // If answered, check nested questions under selected answers
+       const selection = userSelections[questionPath]
+       if (selection) {
+         // Recurse into selected answer's nested questions
+         // ... find and check nested questions ...
+       }
+       return false
+     }
+     
+     return hasPendingInSubtree(props.path)
+   })
+   ```
+
+5. **Clears When**:
+   - User submits selection → Updates `selectionsAtLastSubmit`
+   - User adds thought → Checks `node.user_thoughts.length > 0`
+   - User dismisses question → `isNodeXed()` returns true
+
+**Active Graph Context for Specialists (`axion_swarm/agents.py`):**
+
+1. **New Function**: `build_active_graph_context()` (lines 885-973)
+   - Parses `graph.log` via `analyze_graph_log()`
+   - Filters to active paths only (excludes dismissed `❌` and duplicates `🧹`)
+   - Builds hierarchical list:
+     ```
+     ACTIVE GRAPH PATHS:
+     • [Q:multiple][Which sitter qualifications are important?]
+       - [A][Experience with shy or hiding cats]
+       - [A][References from recent clients]
+       └─ [Q:single][What references should we check?]
+     ...
+     ```
+
+2. **Injection Points** (before instruction prompts):
+   - Phase 1: After conversation history, before "Provide your initial perspective"
+   - Phase 2/Final: After conversation history
+   - Phase 3+: After conversation history
+
+3. **Benefits**:
+   - Eliminates specialist hallucination of non-existent question paths
+   - Provides exact paths for `@[Graph][Update]` voting
+   - Shows what exists for extending with `@[Graph][Create]`
+   - Similar to what Chair sees for de-duplication, but for all specialists
+
+4. **Compact Display** (token efficient):
+   - Limited to 2 nested questions per answer (keeps context manageable)
+   - Truncates long answer text at 100 chars
+   - Header explains dual purpose: voting AND extending
+
+**Critical Bug Fixes:**
+
+1. **NEW Badge Initialization Bug** (`App.vue` lines 1448-1463):
+   - **Problem**: `nodesAtLastSubmit` was cleared on first load, marking all nodes as NEW
+   - **Fix**: Populate set with all current nodes instead of clearing
+   - **Impact**: Existing nodes from graph.log no longer incorrectly show NEW badges
+
+2. **Auto-Collapse After Manual Toggle** (`QuestionNode.vue` lines 835-842):
+   - **Problem**: Questions that user manually toggled wouldn't auto-collapse after submission
+   - **Fix**: Added watcher on `lastSubmissionTimestamp` that clears `userManuallyToggled` flag
+   - **Impact**: All questions with selections now collapse after submit, regardless of manual interaction
+
+3. **Selection Restoration with Empty Initial Update** (`App.vue` lines 1450-1453):
+   - **Problem**: Selections not restored when first `graph_update` had 0 nodes
+   - **Fix**: Run restoration if nodes exist but selections are empty (handles delayed data arrival)
+   - **Impact**: User selections from graph.log now properly restored on page load
+
+**Files Modified:**
+- `web/src/App.vue` (+100 lines): Phase status state, Continue button, pending count logic, selection restoration fix
+- `web/src/components/QuestionNode.vue` (+50 lines): PENDING badge, isPending computed property, CSS styling
+- `webserver.py` (+50 lines): `continue_phase` handler, `phase_status.json` watcher, phase status broadcast
+- `main_tui.py` (+30 lines): Simplified pause logic, `@[System][ContinuePhase]` handler, `phase_status.json` updates
+- `axion_swarm/agents.py` (+90 lines): `build_active_graph_context()`, injection in all phases
+
+**Testing Status**: All features tested and working in production ✅
+
+---
+
+### Graph Tool: Create vs Update Split + Automated De-Duplication (Nov 1, 2025)
+
+**Major Refactor**: Split @[Graph] tool operations to separate node creation from voting, with automated Chair-led duplicate detection.
+
+**Problem Solved**:
+- Specialists using @[Graph][Update] for both creating AND voting caused massive duplication
+- Every specialist re-created same Q->A pairs just to vote (e.g., same path created in Phase 1, then 3 times in Phase 2)
+- No validation preventing duplicate Creates
+- Vote fragmentation across semantically identical paths
+
+**Solution - Two Distinct Operations**:
+
+1. **@[Graph][Create]** - Propose NEW path segments:
+   - Use when FINAL segment in path is NEW (even if parent exists)
+   - System validates path doesn't already exist
+   - Creates new node in graph
+   - Examples: new question, new answer to existing Q, new nested Q under existing A
+
+2. **@[Graph][Update]** - Vote on EXISTING complete paths:
+   - Use when ENTIRE path already exists (adding vote/rationale only)
+   - System validates entire path exists
+   - All emoji actions ([👍][👎][✅][❌][➖][🧹]) use Update
+   - Adds vote/rationale to existing node
+
+**Backend Implementation** (`graph_tool.py`):
+- Global `_created_paths` set tracks all created paths for validation
+- `load_existing_paths_from_log()` populates from graph.log on startup
+- `extract_path_from_content()` extracts normalized paths from operations
+- `normalize_text()` for Unicode normalization in duplicate detection
+- Validation: Create rejects if exists, Update rejects if doesn't exist
+- Exception: question-only and rationale-only Updates allowed
+
+**Chair Automated De-Dupe Pass** (`agents.py`):
+- Runs at end of EACH phase after Chair's synthesis
+- Collects all @[Graph][Create] from that phase only (within-phase comparison)
+- Enriches with vote counts, user engagement signals (✅❌💭) from graph.log analysis
+- Provides Chair with ONLY graph schema:
+  * Create operations with metadata: 👍 votes, 👎 downvotes, ✅ selections, ❌ dismissals, 💭 thoughts
+  * NO user natural language (prevents objective contamination)
+  * Structured prompt ordering: system→rules→data (establishes mode before presenting content)
+- Invokes Chair with `CHAIR_DEDUPE_PASS_SYSTEM` prompt
+- Chair marks semantic duplicates: @[Graph][Update][duplicate][🧹][canonical]
+- **Auto-clears user selections**: When duplicate marked, writes `[➖]` as User (Web UI) to neutralize selections
+- Comprehensive logging to `chair-dedupe.log`:
+  * [1] Full LLM prompt sent to Chair
+  * [2] Create operations being reviewed
+  * [3] Raw LLM response from Chair
+  * [4] Graph operations broadcast to room
+  * [5] Messages added to room after processing
+
+**Chair De-Dupe Prompt** (`CHAIR_DEDUPE_PASS_SYSTEM`):
+- **Structured ordering**: System instructions FIRST (role/rules), data LAST (graph paths)
+  1. Context: WHO YOU ARE (graph analyzer, not conversational assistant)
+  2. Requirements: WHAT YOU MUST DO (structural analysis task)
+  3. Graph Context: THE DATA RULES (duplicate detection criteria)
+  4. Expectations: OUTPUT FORMAT (command syntax with examples)
+  5. Data Input: GRAPH PATHS (actual paths to analyze)
+- **Pure graph schema**: NO user natural language - only graph paths with metadata
+- **Multiple task resets**: "DATA STRUCTURES to analyze, NOT questions to answer"
+- Smart canonical selection with weighted priorities:
+  1. User engagement signals (✅ selections, 💭 thoughts) - HIGHEST priority
+  2. Net vote score (👍 - 👎) - VERY HIGH priority
+  3. Graph structure position - HIGH priority (Chair's expert judgment)
+  4. First occurrence - tie-breaker
+- **Syntax clarity**: Explicit examples showing duplicate≠canonical (must be different paths)
+- Compares within-phase Creates only (specialists run in parallel)
+- Prevents objective contamination through prompt structure alone
+
+**Specialist Prompts** (`prompts.py`):
+- Teaches Create (new segments) vs Update (voting) distinction
+- All examples updated: Create for proposals, Update for votes
+- Duplicate handling: neutral redirect (concept is good, use canonical)
+- Never pursue/extend/cite duplicate paths - migrate to canonical
+- Removed test-case examples (pet sitter, phased rollout, etc.)
+- All examples now generic (Option A/B, Approach X, Requirement Y)
+- Removed arbitrary ranges ("2-4 questions" → "key decision points")
+- Guidance: Graph nodes must add value, not echo user's question
+- Break down user question into SPECIFIC DECISION POINTS
+
+**Frontend Duplicate Handling** (`QuestionNode.vue`):
+- `isDuplicate()` and `getCanonicalPath()` functions
+- Visual treatment: 35% opacity, #e2e8f0 background, 50% grayscale, strike-through text
+- Disabled: inputs, vote buttons, thought buttons (pointer-events: none)
+- Allowed: expand/collapse only (pointer-events: auto on header)
+- 🧹 indicator inline with tooltip showing canonical path
+- Functions properly exported in return statement
+
+**Web UI Toggle** (`App.vue`):
+- "Hide Duplicates 🧹" slide toggle in sidebar
+- Filters duplicates from rootQuestions when enabled
+- Modern toggle switch UI with smooth animation
+- Props passed: voteTally, hideDuplicates
+
+**Benefits**:
+- Eliminates structural duplication at source
+- Automatic semantic duplicate detection
+- Smart canonical selection using user context
+- Clean Web UI with clear duplicate marking
+- Complete audit trail in chair-dedupe.log
+- Domain-agnostic system (no test-case bias in prompts)
+
+**Files Modified**:
+- `axion_swarm/graph_tool.py`: 182 lines added (Create/Update split, validation, path tracking, utilities)
+- `axion_swarm/agents.py`: De-dupe pass logic, user context collection, logging (+100 lines)
+- `axion_swarm/prompts.py`: Create vs Update teaching, de-dupe prompt, genericized examples
+- `graph_parser.py`: Parse both Create and Update (1 line change)
+- `web/src/components/QuestionNode.vue`: Duplicate UI treatment (+80 lines)
+- `web/src/App.vue`: Hide duplicates toggle (+70 lines)
+- `ARCHITECTURE.md`: Updated graph tool documentation
+- `README.md`: Documented new features
+
+---
+
+### Web Interface Evolution (Oct 25-26, 2025)
+
+**Major Milestones**:
+- **User Thoughts Feature** (Oct 26, 2025): Users can add free-text comments/thoughts to any graph node using `@[Graph][Regarding]` syntax. Displayed in Web UI with "💭 Add thought" button, flows through TUI, and specialists treat these as **PREFERRED conversation direction**. Adding a thought marks that node as "seen" (decrements "NEW" count by 1).
+- **Smart Collapse on Submit** (Oct 26, 2025): Changed from layer-based to individual question tracking. Only questions the user interacts with (selections, votes, thoughts) collapse on submit - sibling questions stay in their current state.
+- **FastAPI Migration**: Migrated from Flask to FastAPI for native async/await support and production-grade WebSocket performance (~50ms latency)
+- **Emoji Vote Schema**: Introduced clear visual distinction between user authoritative actions (`[✅]` approve, `[❌]` dismiss, `[➖]` neutral) and specialist advisory votes (`[👍]` upvote, `[👎]` downvote)
+- **Diff Tracking**: Implemented intelligent state tracking to only submit changed selections, reducing redundant commands
+- **Collapsible Layers**: Added smart auto-collapse/expand logic based on user interaction and new node arrival
+- **Per-Question Expansion**: Refined expansion to only affect questions receiving new children, not entire layers
+- **Recursive Change Tracking System** (Oct 26, 2025): 
+  - Local backing object (`graphChangeLog`) tracks entire graph state and changes at ANY depth
+  - "NEW" badges show recursive descendant counts (e.g., "NEW 5" = 5 unseen Q+A nodes within)
+  - Selecting ANY answer in a group marks entire group as "seen" with upward cascade
+  - Auto-expands questions with new descendants and ALL their ancestors
+  - Immediate visual feedback as users engage with content
+  - User selections (✅) count as +1 upvote, same as specialist 👍 votes
+  - Agent vote comments displayed on BOTH questions and answers
+- **Faithful Graph Rendering & Atomic Updates** (Oct 26, 2025):
+  - Questions without answers now visible (mindmap style) - user can dismiss with ❌
+  - Character-by-character bracket parsing (no regex) for robustness
+  - Atomic graph updates: each line creates all intermediate nodes in one operation
+  - Nested questions at unlimited depth (e.g., `[Q][A][Q][A][Q]...`)
+  - Votes stored on specific nodes (full path), never inherited by parents/children
+  - Intermediate answer nodes filtered from UI when they have nested extensions
+- **Deselection Support**: Full state management for multiple-choice items - users can uncheck to send `[➖]` neutral state
+- **Smart Sorting**: Vote-based sorting with user selection priority and newest-first tiebreaker
+- **Codebase Cleanup**: Removed legacy `analyze_graph.py` (888 lines) and static HTML, replaced with focused `graph_parser.py` (167 lines) - 80% code reduction
+
+**Technical Improvements**:
+- Unicode normalization for path deduplication (handling hyphen/dash variations)
+- Immediate dismissal (X button sends `[❌]` instantly without form submit)
+- WebSocket reliability fixes (connection handling, async task scheduling from background threads)
+- Recursive component prop passing fixes
+- Iterative bracket parsing for robust path extraction
+
+**Future Enhancements** (documented but not yet implemented):
+- Neo4j backend for semantic node disambiguation using vector embeddings
+- Automatic pruning of semantically similar paths with cosine similarity
+- Priority-based pruning (keep voted nodes, prune unvoted duplicates)
+
+See `WEB_UI_README.md` for complete web interface documentation.
 
 ---
 
@@ -401,11 +864,11 @@ else:
 
 **Rationale**: 
 - Sequential execution ensures stable performance with Ollama and prevents VRAM thrashing
-- Chair's core functions (synthesis, coordination, likelihood assessment, conflict resolution) require specialist responses to exist first
-- Phase 1 has no specialist responses yet (specialists execute sequentially, Chair would go last and see none)
+- Chair participates in Phase 1 with LIMITED role: duplicate graph path marking ONLY
+- Chair's synthesis functions require specialist cross-pollination (starts Phase 2)
+- Phase 1: Chair watches for duplicate `@[Graph]` proposals, marks with `[🧹]` if detected, otherwise passes
 - **Conflicts are impossible in Phase 1** - specialists are completely isolated, see only User message, have no awareness of each other
-- All Chair functions become actionable starting Phase 2 when specialists can see each other's contributions
-- Skipping Phase 1 saves one LLM call (~6-8 seconds) per conversation with no loss of functionality
+- All Chair coordination functions (synthesis, on-topic, tabling, stagnation) become active Phase 2+ when specialists can see each other's contributions
 
 ### Chair's Tabling Authority - Conflict Resolution
 
@@ -503,6 +966,57 @@ Specialist (next contribution): "@[Chair], I believe [topic B] is pertinent beca
 - Specialist system prompt includes compliance requirement with defense option (`prompts.py::BASE_INSTRUCTION`)
 - Specialists have CRITICAL thinking step to check for Chair's on-topic guidance before each contribution
 - Specialists can respond with `@[Chair], I believe [topic] is pertinent because [reason]...` if they disagree with redirection
+
+### Chair's Duplicate Marking Authority - Graph Consolidation
+
+**Purpose**: Prevent vote fragmentation across semantically identical graph paths by marking duplicates and guiding specialists to consolidate their votes and contributions on canonical paths.
+
+**The Problem**: When specialists independently propose similar answers with slightly different wording (e.g., "Phased rollout" vs "Phased approach"), votes fragment across paths that mean the same thing. This creates noise in the graph and makes it harder for users to see true consensus.
+
+**Chair's Exclusive Authority**:
+
+Chair is the ONLY specialist who can mark graph paths as duplicates using the `[🧹]` marker:
+
+**When to Mark**:
+- Chair sees a NEWER path that's semantically identical to an EXISTING path
+- The existing path already has votes from specialists
+- The paths capture the same meaning but use different wording
+
+**Syntax**: `[duplicate path][🧹][canonical path][comment]`
+
+**Which Path to Mark**:
+- Mark the NEWER duplicate (not the older one)
+- Keep the path with existing votes as canonical
+- Preserves vote history and minimizes disruption
+
+**Example**:
+```
+Phase 4:
+Chair: @[Graph][Update][Q:single][What is approach?][A][Phased rollout][🧹][Q:single][What is approach?][A][Phased approach][Duplicate - "Phased approach" has 5 votes and captures same meaning]
+```
+
+**Specialist Response - Automatic Migration**:
+
+When specialists see a path marked with `[🧹]` from Chair:
+
+1. **Skip voting on duplicate** → Vote on canonical path instead
+2. **Never extend duplicate** → Add follow-ups under canonical path only
+3. **Migrate previous contributions** → If they voted on or built out the duplicate, recreate under canonical path
+
+**Benefits**:
+- Eliminates vote fragmentation
+- Creates clear consensus signals for users
+- Prevents dead branches in the graph tree
+- Chair has holistic view to spot semantic duplicates
+- Machine-parseable syntax enables automated consolidation
+
+**Implementation**:
+- Backend: `axion_swarm/graph_tool.py` recognizes `[🧹]` marker and validates syntax
+- Parser: `graph_parser.py` extracts canonical path reference from duplicate votes
+- Frontend: `web/src/components/QuestionNode.vue` displays 🧹 badge with hover tooltip showing canonical path
+- Prompts: `axion_swarm/prompts.py` documents Chair's exclusive role and specialist migration behavior
+
+See "Duplicate Path Handling (Chair-Led Consolidation)" section in @[Graph] Tool documentation for complete workflow examples.
 
 ### Chair's Stagnation Detection (Phase 4+)
 
@@ -1218,21 +1732,24 @@ if current_phase == 1:
 
 **Algorithm Note**: Phase 1 has no active message filtering, but implementation deliberately shows ONLY User message to maintain complete isolation. Specialists execute sequentially (Context → Research → ... → [other specialists]), and each specialist sees ONLY the User message, not any prior specialists' Phase 1 responses. This ensures true independent thinking without any anchoring effects.
 
-**Chair Does Not Participate in Phase 1**: Chair is positioned last in the execution order, but **skips Phase 1 silently**. Rationale:
-- Chair's core functions are **synthesis, coordination, on-topic enforcement, likelihood assessment, and conflict resolution**
-- **Chair needs specialists to have completed cross-pollination before synthesis is meaningful**:
-  - Phase 1 is just initial independent assessments (specialists see only User, isolated)
-  - Phase 2 is when specialists review what OTHERS said in Phase 1 and respond (cross-pollination begins)
-  - Chair synthesizes in Phase 2 after specialists have had one full phase to contribute back
-  - **Without Phase 2 cross-pollination, there's no discussion to coordinate** - just isolated independent assessments
-- **All Chair functions require cross-pollination to be actionable**:
-  - **Synthesis**: No discussion yet - just independent assessments with no interaction
-  - **On-topic enforcement**: Need to see how specialists respond to each other, not just initial takes
-  - **Conflict resolution**: Conflicts are IMPOSSIBLE in Phase 1 - specialists see only User message, have no awareness of each other, cannot disagree or debate
-  - **Likelihood assessment**: Works best when specialists have reacted to each other's concerns
-- Chair will see ALL Phase 1 responses AND Phase 2 responses when participating in Phase 2
-- This saves one LLM call (~6-8 seconds) with no loss of information or functionality
-- Chair's synthesis after Phase 2 is more valuable - captures both initial takes AND cross-pollinated discussion
+**Chair Participates in Phase 1 (Duplicate Marking Only)**: Chair is positioned last in the execution order and participates in Phase 1 with a **LIMITED role**:
+- **Phase 1 Role: Watch for duplicate graph paths ONLY**
+  - Specialists may independently propose similar graph questions/answers with different wording (e.g., "Phased rollout" vs "Phased approach")
+  - Chair marks duplicates IMMEDIATELY using `[🧹][canonical path][comment]` syntax
+  - Keeps first proposed path as canonical, marks later duplicates
+  - Prevents vote fragmentation before specialists start building on paths
+  - If no duplicates detected, Chair passes silently with "I have no further comments at this time"
+- **What Chair DOES NOT DO in Phase 1:**
+  - ❌ No synthesis (no cross-pollination yet - specialists haven't seen each other)
+  - ❌ No on-topic enforcement (specialists are addressing User's request directly)
+  - ❌ No conflict resolution (conflicts impossible - specialists are completely isolated)
+  - ❌ No likelihood assessment (needs cross-pollination to be meaningful)
+  - ❌ No general commentary or coordination
+- **Phase 2+ Role: Full synthesis and coordination**
+  - Chair will see ALL Phase 1 responses AND Phase 2 responses when participating in Phase 2
+  - Chair's synthesis after Phase 2 captures both initial takes AND cross-pollinated discussion
+  - All coordination functions (synthesis, on-topic, tabling, stagnation detection) become active
+  - Duplicate marking continues in all phases as needed
 
 **Instructions Given**:
 ```
@@ -1915,7 +2432,15 @@ MESSAGE COUNT: 3 messages being sent to LLM
 ### ANSI Color Codes (`axion_swarm/colors.py`)
 - **Dark Green** (`\033[32m`): `<think>` blocks (internal reasoning)
 - **Light Green** (`\033[92m`): Public conversation messages
-- **Yellow** (`\033[93m`): Status/debug messages
+- **Light Blue** (`\033[94m`): User mentions, tool references, Graph content
+- **Cyan** (`\033[96m`): Notice labels
+- **Light Purple** (`\033[95m`): Specialist mentions (in room)
+- **Yellow** (`\033[93m`): Status/debug messages, Graph Q/A markers
+- **Orange** (`\033[38;5;208m`): Graph operation markers (Update, Collapse, Because)
+- **Red** (`\033[91m`): Specialist mentions (available, not in room)
+- **White** (`\033[97m`): Primary content, timestamps, Graph structure
+- **Dark Grey** (`\033[90m`): Metadata (URLs, titles)
+- **Light Grey** (`\033[37m`): Supporting evidence
 - **Reset** (`\033[0m`): Return to default
 
 ### Color Usage
@@ -1925,6 +2450,40 @@ MESSAGE COUNT: 3 messages being sent to LLM
 - Agent status headers: Yellow on stderr
 - Thinking blocks: Dark green on stderr
 - Debug messages: Default on stderr
+
+### Mention Colorization (`main.py:highlight_mentions()`)
+
+Specialist messages are automatically colorized for enhanced readability:
+
+**Specialist Mentions**:
+- `@[User]` → **Light blue** (user references)
+- `@[Specialist Name]` (in room) → **Light purple**
+- `@[Specialist Name]` (available, not in room) → **Red**
+
+**Tool Syntax**:
+- `@[Search][query]` → `@[Search]` in **light blue**, query in **white**
+- `@[ReadURL][url]` → `@[ReadURL]` in **light blue**, URL in **white**
+
+**Graph Tool Syntax** (colorizes entire nested bracket structure):
+```
+@[Graph][Update][Q:single][What is the deployment approach?][A][Phased rollout][👍][Reduces risk]
+@[Graph][If][Q:single][What is the deployment approach?][A][Phased rollout]
+@[Graph][Because][Q:single][What is the deployment approach?][A][Phased rollout]
+```
+- `@[Graph]` → **Light blue** (tool mention, same as `@[Search]`)
+- `[Update]`, `[Collapse]`, `[Because]`, `[If]` → **Orange** (operation markers)
+- `[Q]`, `[A]`, `[Q:single]`, `[Q:multiple]`, `[Q:open]` → **Yellow** (question/answer markers)
+- `[👍]`, `[👎]`, `[✅]`, `[❌]`, `[➖]` → **Yellow** (vote and state markers, emoji-based)
+- Question text `[What is the deployment approach?]` → **Light blue**
+- Answer text `[Phased rollout]` → **Light blue**
+- Comment text `[Reduces risk]` → **Light blue**
+
+**XML Elements**:
+- `<answer>...</answer>` → Content in **white** (primary)
+- `<result>...</result>` → Content in **light grey** (supporting evidence)
+- XML attributes → **Dark grey** (metadata) except `query="..."` in **white**
+
+**Implementation**: The `colorize_graph_mentions()` function in `colors.py` parses nested bracket structures and applies colors based on bracket content type, while `highlight_mentions()` in `main.py` coordinates all colorization patterns.
 
 ## Timestamp System
 
@@ -2238,9 +2797,11 @@ Users see traditional timestamped chat format on stdout with ALL whitespace coll
 - This creates compact single-line display for human readability
 - The original multi-line content is preserved in state for agents to see
 
-### Explicit Addressing with @ Mentions
+### 🔥 MANDATORY: Explicit Audience Marking
 
-**Purpose**: Make it 100% clear who each part of a message is directed to, enabling natural group discussion flow.
+**CRITICAL REQUIREMENT**: Every piece of text (outside tool usage) MUST explicitly mark WHO it's intended for.
+
+**Purpose**: Create 100% clarity on who should read each part of every message, enabling perfect audience targeting and efficient scanning.
 
 **Format**: `@[Name], message content`
 - Brackets `[ ]` provide visual distinction
@@ -2248,25 +2809,62 @@ Users see traditional timestamped chat format on stdout with ALL whitespace coll
 - Messages are isolated in `<content>` XML tags (structural clarity)
 - Familiar pattern (like addressing someone in email/chat)
 
-**@ Mention Targets**:
-- `@[User], ` - Address the User (their explicit question or request)
-- `@[Other specialist name], ` - Address specific specialist (full role name with "specialist")
-- `@[Chair], ` - Address Chair (coordinator)
-- `@[All], ` - Address everyone (optional, for general observations)
+**Required Audience Markers**:
+- `@[All]` - Text intended for EVERYONE (all specialists + User, both now and future)
+- `@[User]` - Text directed specifically at the User
+- `@[Specialist name]` - Text directed at a specific specialist (full role name with "specialist")
+- `@[Chair]` - Text directed at Chair (coordinator)
 
-**Usage by Pass**:
-- **Phase 1**: Only `@[User], ` (independent assessments, only talking to User)
-- **Phase 2**: Primarily `@[User], ` (still focused on User's request)
-- **Phase 3+**: Can use `@[User], `, `@[Specialist name], `, or `@[All], ` (open discussion phase)
+**Specialists can switch between audiences even sentence-by-sentence:**
 
-**When to Use @[User] vs Speaking "To All"**:
-- **Use `@[User]` mention**: Only for unanswered items that need User input (questions, clarification requests, information gaps)
-- **Speak "to all" (no mention)**: When providing answers, insights, or information in response to the User's question
-- **Rationale**: Answers are for everyone's benefit in the discussion. Direct mentions should be reserved for interactive dialogue requiring user response.
-- **Examples**:
-  - ✅ "@[User], [clarifying question about missing detail]?" (question - needs input)
-  - ✅ "[Technical recommendation with reasoning]." (answer - no mention)
-  - ✅ "[Insight or observation about the approach]." (insight - no mention)
+✅ CORRECT - Multiple audience switches:
+```
+@[All] The core issue is ambiguous requirements. @[User], what is your primary objective? @[All] Until we clarify this, we're making assumptions. @[Research specialist], have you found standards on this topic?
+```
+
+✅ CORRECT - Single audience throughout:
+```
+@[All] Based on the requirements, I recommend a phased approach with three stages: initial prototype, beta testing, and full rollout. This balances risk against timeline constraints.
+```
+
+❌ INCORRECT - No audience marker:
+```
+The core issue is ambiguous requirements. We need to clarify this first.
+```
+
+❌ INCORRECT - Partial marking:
+```
+@[All] The core issue is requirements. What should we do next?  ← No marker for second sentence
+```
+
+**When to Use Each Marker**:
+
+**@[All] - Use for:**
+- General analysis, observations, recommendations meant for everyone
+- Technical explanations shared with the group
+- Risk assessments everyone should understand
+- Building on others' points for group discussion
+- Any content that everyone should read
+
+**@[User] - Use for:**
+- Questions asking for User's input or clarification
+- Recommendations specifically for User's decision
+- Addressing User's explicit concerns directly
+- Requesting User confirmation or authorization
+
+**@[Specialist name] - Use for:**
+- Questions about their specific contribution
+- Asking them to elaborate on their point
+- Deferring to their expertise
+- Building directly on their observation
+
+**@[Chair] - Use for:**
+- Suggesting specialists to bring in
+- Flagging discussion issues (tangents, conflicts)
+- Observations about group process
+
+**Tool Usage Exception:**
+Tool syntax like `@[Graph][Update][Q][...]` or `@[Search][query]` does NOT need audience markers - these are system commands, not conversational text.
 
 **Message Structure - Statements First, Then Engage Individuals**:
 - **Start with statements and answers**: Provide insights, recommendations, and observations WITHOUT mentions (speaking to all)
@@ -3397,6 +3995,833 @@ The `<content>` element contains the full markdown with all metadata as attribut
 
 ---
 
+### Collaborative Knowledge Construction (@[Graph] TOOL - PROTOTYPE)
+
+The `@[Graph]` tool enables specialists to collaboratively build structured decision trees through question-answer pairs with cross-domain voting.
+
+**⚠️ PROTOTYPE STATUS**: Backend not yet implemented. Specialists use the syntax to express structured thinking, and we observe usage patterns before building the full Neo4j graph database implementation.
+
+**Core Concept - Semantic Vector Building**:
+
+Each Question→Answer pair is a semantic vector. All selected pairs become the embedded knowledge base (THE OUTPUT):
+- **Questions** define decision points (what User needs to decide)
+- **Answers** are alternative options (possible choices)
+- **Voting** shows specialist consensus (cross-validation across domains)
+- **User selection** locks in the final choice (User authority overrides all)
+- **Paths** show dependencies (this answer unlocks that question)
+- **The graph IS the deliverable** - not a planning artifact
+
+**Who Uses It**:
+
+- **Context specialist (MANDATORY)**: Proposes key decision-point questions in Phase 1, extends paths in Phase 2+
+- **All specialists**: Vote on proposals from their domain perspective, add alternative answers
+- **Chair**: Runs de-dupe pass at end of each phase to mark semantically duplicate paths
+- **User**: Selects final answers via Web UI
+
+**Two Core Operations - Create vs Update**:
+
+The graph tool uses TWO distinct operations to separate path creation from voting:
+
+**@[Graph][Create]** - Propose NEW path segments:
+- Use when the FINAL segment in your path is NEW (question or answer)
+- System validates the path doesn't already exist
+- Examples:
+  - New question: `@[Graph][Create][Q:single][What is X?]`
+  - New answer to existing question: `@[Graph][Create][Q:single][What is X?][A][Option Y]`
+  - New nested question: `@[Graph][Create][Q:single][...][A][...][Q:single][What about Z?]`
+
+**@[Graph][Update]** - Vote on EXISTING complete paths:
+- Use when the ENTIRE path already exists (adding vote/rationale only)
+- System validates the entire path exists
+- Examples:
+  - Vote on path: `@[Graph][Update][Q:single][What is X?][A][Option Y][👍][Reasoning here]`
+  - Add rationale: `@[Graph][Update][Q:single][...][A][...][👎][Concerns here]`
+  - User actions: `@[Graph][Update][path][✅]` (approve), `[❌]` (dismiss), `[➖]` (neutral)
+  - Chair duplicate marking: `@[Graph][Update][duplicate][🧹][canonical]`
+- **ALL emoji actions ([👍][👎][✅][❌][➖][🧹]) use Update**, never Create
+
+**The Rule**: If adding ANY new Q or A segment → Create. If just voting/commenting/marking existing path → Update.
+
+**Chair's De-Dupe Pass**:
+- At end of each phase, Chair reviews ALL @[Graph][Create] operations
+- Marks semantic duplicates (same meaning, different wording) using @[Graph][Update][duplicate][🧹][canonical]
+- Specialists see duplicates marked and migrate votes to canonical paths
+- Prevents vote fragmentation across semantically identical paths
+
+**Syntax Examples**:
+
+```
+@[Graph][Create][Q:single][What is the deployment approach?]
+@[Graph][Create][Q:single][What is the deployment approach?][A][Phased rollout over 3 months]
+@[Graph][Update][Q:single][What is the deployment approach?][A][Phased rollout over 3 months][👍][Reduces risk and allows validation]
+@[Graph][Create][Q:single][What is the deployment approach?][A][Big bang deployment]
+@[Graph][Update][Q:single][What is the deployment approach?][A][Big bang deployment][👎][Too risky for MVP]
+@[Graph][Create][Q:single][What is the deployment approach?][A][Phased rollout][Q:single][What are the phase boundaries?]
+@[Graph][Because][Q:single][What is the deployment approach?][A][Phased rollout]  ← Citation (existing/chosen path as fact)
+@[Graph][If][Q:single][What is the deployment approach?][A][Phased rollout]      ← Citation (explore potential path)
+```
+
+**Citations - `[Because]` vs `[If]` vs `[Regarding]`**:
+
+- **`[Because]`** - Cite existing/chosen paths as facts for context:
+  ```
+  @[Graph][Because][Q:single][What is the deployment approach?][A][Phased rollout]
+  Given the phased approach, we need to plan incremental resource allocation...
+  ```
+
+- **`[If]`** - Explore potential paths hypothetically to drive discussion along open DAG paths:
+  ```
+  @[Graph][If][Q:single][What is the deployment approach?][A][Phased rollout]
+  @[All] If we choose phased rollout, we should consider:
+  - Resource ramping strategy across phases
+  - Rollback procedures between phases
+  This drives discussion down this open path before User makes final selection.
+  ```
+
+- **`[Regarding]`** - User adds free-text thoughts/comments on any graph node (question or answer):
+  ```
+  @[Graph][Regarding][Q:single][What is the deployment approach?][This needs more discussion before deciding]
+  @[Graph][Regarding][Q:single][What is the deployment approach?][A][Phased rollout][I like this approach but concerned about timeline]
+  ```
+  - Allows user to annotate nodes with reasoning, concerns, or context
+  - Thoughts are displayed in Web UI under nodes as "👤 Your thoughts" with timestamps
+  - Adding a thought marks that specific node as "seen" (decrements "NEW" count by 1)
+  - Specialists treat `[Regarding]` entries as the **PREFERRED conversation direction** for that area
+  - If user adds `[Regarding]` to a node (especially after dismissing specialist suggestions), specialists should re-base the conversation on the user's thought
+  - Helps guide agent discussion and documents user's decision-making process
+  - Stored in graph.log and included in graph state broadcasts
+
+**🔥 CRITICAL - NEVER use `[Because]` for paths marked with `[X]`:**
+
+Paths marked with `[X]` are explicitly closed by the User. They are NOT facts and MUST NOT be cited with `[Because]`.
+
+```
+❌ WRONG:
+@[Graph][Because][Q:single][What is the deployment approach?][A][Big bang deployment][X]
+Given the big bang approach... ← WRONG! The [X] means User rejected this path.
+
+✅ CORRECT:
+@[Graph][Because][Q:single][What is the deployment approach?][A][Phased rollout]
+Given the phased approach... ← Only cite open or chosen paths with [Because]
+```
+
+**IMPORTANT**: ALL questions must include a type suffix (`[Q:single]`, `[Q:multiple]`, or `[Q:open]`), including follow-up questions nested under answers. Never use plain `[Q]` without a type.
+
+---
+
+## 🛡️ VALIDATION GUARD SYSTEM - Protecting Graph Integrity
+
+### Automatic Guard Against Invalid Schema
+
+The system **actively guards against malformed graph updates** and **scolds specialists** when they violate schema rules. This ensures data integrity at every layer and educates specialists on correct syntax.
+
+**Philosophy**: Rather than silently accepting bad data or cryptically failing, the system:
+1. **Guards**: Validates every `@[Graph][Update]` in real-time
+2. **Scolds**: Provides targeted educational feedback to the specialist
+3. **Protects**: Ensures graph.log and Web UI never contain malformed entries
+4. **Educates**: Shows correct examples based on what they attempted
+
+This is a **safety net for both human specialists and LLM agents**, preventing data corruption from copy-paste errors, syntax misunderstandings, or AI hallucinations.
+
+---
+
+**🚨 VALIDATION ENFORCED - Malformed Updates Are Rejected**:
+
+The system validates all `@[Graph][Update]` entries in real-time. **Malformed entries are rejected** and will:
+1. **NOT be written to graph.log** (the entry is skipped)
+2. **Display a warning in the TUI** (stderr output with error details)
+3. **Inject a Notice message to @[All]** (all specialists see the error and are informed the entry was rejected)
+
+**Most Common Validation Error - Multiple Consecutive `[A]` Segments**:
+
+Each answer MUST be a separate `@[Graph][Update]` entry. You cannot chain multiple answers in a single update.
+
+❌ **INVALID (will be rejected)**:
+```
+@[Graph][Update][Q:single][What is the budget?][A][$200][A][$500][A][$1000]
+```
+
+✅ **CORRECT (use separate entries)**:
+```
+@[Graph][Update][Q:single][What is the budget?][A][$200]
+@[Graph][Update][Q:single][What is the budget?][A][$500]
+@[Graph][Update][Q:single][What is the budget?][A][$1000]
+```
+
+**Error Notice Format**:
+
+When validation fails, all specialists will see a concise, targeted Notice:
+```
+@[All] Notice: @[Specialist Name]'s @[Graph][Update] was MALFORMED and not added to the graph.
+
+Attempted: @[Graph][Update][Q:single][What is the budget?][A][$200][A][$500][A][$1000]
+
+Error: INVALID: Multiple consecutive [A] segments found. Each answer must be a separate @[Graph][Update] entry.
+
+**Correct approach** - Each answer must be a separate @[Graph][Update]:
+  @[Graph][Update][Q:type][Question][A][Option 1]
+  @[Graph][Update][Q:type][Question][A][Option 2]
+  @[Graph][Update][Q:type][Question][A][Option 3]
+
+Valid patterns: [Q:type][text] | [Q:type][text][A][text] | [Q:type][text][A][text][Q:type][text][A][text]
+Invalid: [A][text][A][text] - cannot chain multiple [A] segments
+
+@[Specialist Name], please resubmit with separate entries for each answer.
+```
+
+The Notice provides:
+1. What was attempted (preview)
+2. Specific validation error
+3. Targeted correct example showing the fix
+4. Quick reference of valid vs invalid patterns
+5. Clear instruction to resubmit
+
+**What This Guards Against** - Real-World Test Cases:
+
+| Case | What Specialist Attempts | Why It's Wrong | Actions Taken |
+|------|--------------------------|----------------|---------------|
+| **1. Multiple Answers at Same Level** | `@[Graph][Update][Q:single][Budget?][A][$200][A][$500][A][$1000]` | Multiple consecutive `[A]` at same level - each answer must be separate entry | ❌ Backend validation fails<br>⚠️ TUI shows stderr warning<br>📢 Notice to @[All] with targeted example<br>🚫 NOT written to graph.log<br>👁️ Web UI never displays these options |
+| **2. Nested with Multiple Answers** | `@[Graph][Update][Q:single][Parent?][A][Ans1][Q:single][Child?][A][Ans2][A][Ans3]` | Consecutive `[A]` segments at nested level | ❌ Backend validation fails<br>⚠️ TUI shows "nested levels" pattern warning<br>📢 Notice shows how to build nested paths correctly<br>🚫 NOT written to graph.log<br>👁️ Entire malformed path invisible in Web UI |
+| **3. Answers Without Question** | `@[Graph][Update][A][Option1][A][Option2]` | Missing question, multiple answers | ❌ Backend validation fails<br>⚠️ TUI warning<br>📢 Notice shows generic correct pattern<br>🚫 NOT written to graph.log |
+| **4. Mixed Answer Types** | `@[Graph][Update][Q:single][What?][A][Standard][A:ReadURL][From source]` | Both `[A]` and `[A:ReadURL]` counted as answers, consecutive detection triggers | ❌ Backend validation fails<br>📢 Notice to @[All]<br>🚫 Neither answer added to graph |
+| **5. Deep Nesting Error** | `@[Graph][Update][Q][L1][A][A1][Q][L2][A][A2][A][A3][Q][L3][A][A4]` | Consecutive answers at middle level (L2) | ❌ Fails at `[A2][A3]`<br>⚠️ TUI shows "nested levels" warning<br>🚫 4-level path never created |
+| **✅ VALID: Single Answer** | `@[Graph][Update][Q:single][Approach?][A][Phased]` | Correct - one answer | ✅ Passes validation<br>📝 Written to graph.log<br>👁️ Rendered in Web UI<br>☑️ User can select |
+| **✅ VALID: With Vote** | `@[Graph][Update][Q:single][?][A][Phased][👍][Reduces risk]` | Correct - one answer + vote | ✅ Passes validation<br>📝 Written with vote<br>👁️ Rendered with upvote indicator |
+| **✅ VALID: Nested Path** | `@[Graph][Update][Q:single][Parent?][A][Ans1][Q:single][Child?][A][Ans2]` | Correct - one answer per level, separated by `[Q]` | ✅ Passes validation<br>📝 Creates full nested path<br>👁️ Web UI shows expandable structure |
+
+**Summary of What We Guard Against**:
+1. **Efficiency Mistakes**: Specialist tries to add all answer options in one update → Rejected, taught correct approach
+2. **Nested Structure Confusion**: Specialist tries to answer multiple levels at once → Rejected, shown how to build paths
+3. **Copy-Paste Errors**: Accidentally chaining multiple entries → Rejected before corruption
+4. **Syntax Misunderstandings**: Thinking `[A][A][A]` is valid list syntax → Rejected with education
+5. **LLM Hallucinations**: AI model generates invalid syntax → Rejected, prevents bad training data
+6. **Data Corruption**: Malformed entries never reach graph.log or Web UI → Database stays clean
+7. **User Confusion**: Invalid options never appear in decision tree → User only sees valid, selectable choices
+
+**How the Scolding Works**:
+
+The system analyzes the invalid pattern and provides **targeted feedback**:
+- **Pattern 1 detected** (multiple answers at same level) → Shows how to separate answers into individual entries
+- **Pattern 2 detected** (multiple answers across nested levels) → Shows how to build nested paths correctly
+- **Generic fallback** → Shows basic correct pattern
+
+Example scold message:
+```
+@[All] Notice: @[Context specialist]'s @[Graph][Update] was MALFORMED and not added to the graph.
+
+Attempted: @[Graph][Update][Q:single][What is the budget?][A][$200][A][$500][A][$1000]
+
+Error: INVALID: Multiple consecutive [A] segments found...
+
+**Detected pattern**: Multiple answers to the same question in one entry.
+
+**Correct approach** - Each answer must be a separate @[Graph][Update]:
+  @[Graph][Update][Q:type][Your question][A][First option]
+  @[Graph][Update][Q:type][Your question][A][Second option]
+  @[Graph][Update][Q:type][Your question][A][Third option]
+
+**Key rule**: Valid patterns have at most one [A] per nesting level.
+Invalid: [A][text][A][text] ❌
+Valid: [Q:type][text][A][text] ✅ | [Q:type][text][A][text][Q:type][text][A][text] ✅
+
+@[Context specialist], please resubmit with separate entries.
+```
+
+All specialists see this Notice, understand what went wrong, and **the specialist is encouraged to resubmit the SAME content using the correct format**—the contribution is valuable, only the syntax was wrong. The Notice explicitly tells them: "your contribution is valuable—please resubmit the SAME content using separate @[Graph][Update] entries. Don't skip this contribution; just use the correct format above."
+
+**Key Principle**: The goal is **correction, not suppression**. When a specialist submits invalid syntax, we want them to:
+- ✅ **Resubmit the same content** in correct format
+- ❌ **NOT skip their contribution** thinking it was rejected
+
+The validation system guards against malformed syntax, not against the specialist's ideas.
+
+**Multi-Layer Defense**:
+- **Layer 1 (Backend)**: `axion_swarm/graph_tool.py` - Validates before writing to graph.log, generates scolding Notice
+- **Layer 2 (graph.log)**: Malformed entries never written, maintains data integrity
+- **Layer 3 (Frontend)**: `graph_parser.py` - Validates when parsing graph.log, skips any that slip through
+- **Layer 4 (Web UI)**: Only valid nodes rendered, user never sees malformed options
+
+**Implementation**:
+- **Backend validation**: `axion_swarm/graph_tool.py` - `validate_graph_update()` and `log_graph_operations()`
+- **Frontend validation**: `graph_parser.py` - `validate_graph_path()` in `analyze_graph_log()`
+- **TUI warnings**: Printed to stderr with `⚠️` symbol, visible during agent execution
+- **Notice injection**: AIMessage with name="Notice", injected into conversation history
+- **Web UI**: Malformed entries are skipped in Vue.js rendering (only valid nodes displayed)
+- **Unit tests**: `test_validation.py` - Verifies all guard and scold behavior
+
+---
+
+### 📚 For Future Development - Extending the Guard System
+
+**Philosophy: Guard and Educate, Never Silent Failure**
+
+The validation guard system follows a "loud and helpful" philosophy:
+- **Never silently accept bad data** - Always validate and reject malformed entries
+- **Never cryptically fail** - Always explain what went wrong and why
+- **Always educate** - Show correct examples based on what they attempted
+- **Always be visible** - Log to TUI, inject Notice to conversation, skip in Web UI
+- **Always encourage resubmission** - Tell specialist to resubmit SAME content in correct format (contribution is valuable, only syntax was wrong)
+
+**When to Add New Validation Rules**:
+
+Add validation when you observe:
+1. **Repeated mistakes**: Specialists consistently make the same error
+2. **Data corruption**: Invalid entries causing crashes or rendering issues
+3. **User confusion**: Malformed data appearing in Web UI making it unusable
+4. **LLM hallucinations**: AI models generating syntactically invalid patterns
+
+**Do NOT add validation for**:
+- Semantic errors (wrong domain advice) - that's what voting is for
+- Stylistic preferences (wording choices) - specialists have freedom
+- Complete vs incomplete information - specialists work iteratively
+
+**How to Add a New Validation Rule**:
+
+1. **Identify the invalid pattern** - What specifically is wrong?
+   ```python
+   # Example: Detecting empty question text
+   if item.startswith('Q:') and next_item == '':
+       return False, "Empty question text", pattern_info
+   ```
+
+2. **Update `validate_graph_update()` in `graph_tool.py`**:
+   ```python
+   # Add detection logic
+   # Update pattern_info dict with new flags
+   # Return False with clear error message
+   ```
+
+3. **Add pattern detection for targeted Notice**:
+   ```python
+   # In log_graph_operations(), add new elif branch:
+   elif pattern_info.get('has_empty_question'):
+       notice_content += "**Detected pattern**: Empty question text..."
+   ```
+
+4. **Mirror in frontend** - Update `validate_graph_path()` in `graph_parser.py` to match
+
+5. **Add test case** to `test_validation.py`:
+   ```python
+   def test_empty_question():
+       test = "@[Graph][Update][Q:single][][A][Answer]"
+       is_valid, error_msg, pattern_info = validate_graph_update(test)
+       assert not is_valid
+       assert pattern_info.get('has_empty_question')
+   ```
+
+6. **Update prompts** - Add example to `prompts.py` showing invalid vs valid
+
+7. **Document** - Add to the test case table in ARCHITECTURE.md
+
+**Testing Your Validation**:
+
+```bash
+# Run validation tests
+source venv/bin/activate
+python test_validation.py
+
+# Expected output: ALL TESTS PASSED ✓
+```
+
+**Best Practices for Guard Systems**:
+
+1. **Single-pass parsing** - Parse brackets once, extract all info (efficient)
+2. **Rich return values** - Return `(is_valid, error_msg, pattern_info)` not just boolean
+3. **Pattern detection** - Analyze what they attempted, provide targeted guidance
+4. **Multi-layer defense** - Validate at backend AND frontend (belt + suspenders)
+5. **Comprehensive testing** - Test both invalid cases AND valid cases
+6. **Educational notices** - Show what they attempted, why it's wrong, correct approach
+7. **No silent failures** - Always log, warn, and inform
+8. **Encourage resubmission** - Tell specialist "your contribution is valuable—please resubmit the SAME content" (correction not suppression)
+
+**Example: Adding "Empty Question Text" Validation**
+
+```python
+# Step 1: In validate_graph_update()
+if item.startswith('Q:') and i + 1 < len(bracket_contents):
+    next_item = bracket_contents[i + 1]
+    if not next_item or next_item.strip() == '':
+        pattern_info['has_empty_question'] = True
+        return False, "INVALID: Question text cannot be empty", pattern_info
+
+# Step 2: In log_graph_operations()
+elif pattern_info.get('has_empty_question'):
+    notice_content += (
+        f"**Detected pattern**: Empty question text.\n\n"
+        f"**Correct approach** - Always provide question text:\n"
+        f"  @[Graph][Update][Q:single][What is your actual question?][A][Answer]\n"
+    )
+
+# Step 3: In test_validation.py
+def test_empty_question():
+    test = "@[Graph][Update][Q:single][][A][Answer]"
+    is_valid, error_msg, pattern_info = validate_graph_update(test)
+    assert not is_valid
+    assert 'empty' in error_msg.lower()
+    assert pattern_info.get('has_empty_question') == True
+```
+
+**Maintenance Checklist**:
+
+When modifying validation:
+- [ ] Update backend validation (`graph_tool.py`)
+- [ ] Update frontend validation (`graph_parser.py`)
+- [ ] Add test case (`test_validation.py`)
+- [ ] Update prompts with example (`prompts.py`)
+- [ ] Document in ARCHITECTURE.md
+- [ ] Run all tests to ensure nothing broke
+- [ ] Test with actual LLM to verify Notice is helpful
+
+**Philosophy: Why This Matters**
+
+Bad data is **exponentially more expensive** than validation:
+- Malformed entry in graph.log → corrupts all downstream processing
+- Invalid option in Web UI → user selects it → entire decision tree becomes unreliable
+- LLM learns from bad examples → generates more bad syntax → cycle of corruption
+
+The validation guard system **pays for itself** by:
+- Preventing data corruption at source
+- Educating specialists in real-time (they learn correct syntax)
+- Maintaining Web UI quality (users only see valid choices)
+- Providing clean training data (if conversations are used for future fine-tuning)
+
+**Remember**: It's better to loudly reject and educate than silently accept and corrupt.
+
+**Question Types (Selection Modes)**:
+
+**🔥 DEFAULT TO `[Q:multiple]` UNLESS ANSWERS ARE ORTHOGONAL:**
+
+Prefer `[Q:multiple]` (checkboxes) as your default choice. Only use `[Q:single]` when answers are truly mutually exclusive.
+
+**Test:** Can the user reasonably want BOTH answer A and answer B? → Use `[Q:multiple]`
+
+---
+
+- `[Q:multiple]` - User can select MULTIPLE answers at once, like **checkboxes** (PREFERRED DEFAULT)
+  - Example: `@[Graph][Update][Q:multiple][Which features are required?]`
+  - All answers under this question can be selected together
+  - **Question wording**: Use plural/multiple form - "Which features...", "What capabilities...", "Which requirements..."
+  - **Use this by default** unless answers are truly mutually exclusive
+  
+- `[Q:single]` - User picks ONE answer only, like **radio buttons** (mutually exclusive only)
+  - Example: `@[Graph][Update][Q:single][What is the deployment approach?]`
+  - All answers under this question are mutually exclusive
+  - **Question wording**: Use singular form - "What is...", "Which approach...", "What should..."
+  - **UI behavior** (future): When User selects one answer, all other answers automatically get `[X]` and are closed
+  - **ONLY use when picking one answer excludes the others** (truly orthogonal)
+  
+- `[Q:open]` - User adds unlimited custom answers (brainstorming mode)
+  - Example: `@[Graph][Update][Q:open][What are your constraints?]`
+  - **Question wording**: Open-ended - "What are...", "List any...", "What other..."
+
+**Important**: 
+- **Frame questions to match selection mode** - singular for single-choice, plural for multiple-choice
+- Answers `[A]` don't have type suffixes - they automatically inherit the selection mode from their parent question
+- If an answer is under `[Q:single]`, it's a radio button option; under `[Q:multiple]`, it's a checkbox option
+- **When in doubt, use `[Q:multiple]`** - most questions benefit from allowing multiple complementary answers
+
+**Voting System**:
+
+Specialists vote on questions and answers using simple syntax:
+- `[+]` - **Upvote** - "This should be in the semantic space"
+- `[-]` - **Downvote** - "This should be removed from scope"
+
+**Examples:**
+```
+@[Graph][Update][Q:single][What is the deployment approach?][👍]
+@[Graph][Update][Q:single][What is the deployment approach?][A][Phased rollout][👍][Reduces risk and allows validation]
+@[Graph][Update][Q:single][What is the deployment approach?][A][Big bang deployment][👎][Too risky for MVP]
+```
+
+**🔥 VOTING IS MANDATORY FOR ALL SPECIALISTS:**
+- **Every specialist MUST vote on EVERY [Q] and [A] node they see** - at minimum upvote [👍] or downvote [👎]
+- **VOTE ONCE when you first see a node** - vote immediately from your domain perspective
+- **Vote on BOTH question and answer nodes:**
+  - **[Q] nodes**: Is this question path valuable to explore? `[👍]` = reasonable direction, `[👎]` = discourage this path
+  - **[A] nodes**: Is this answer valid/good? `[👍]` = agree/keep, `[👎]` = disagree/remove
+- **Your comment context = ENTIRE path from root to this node** - not just the immediate node
+- **Voting is HOW the graph functions** - it determines which paths stay open (high votes) and which close (2+ downvotes)
+- **Your domain perspective is essential** - other specialists can't provide your expertise's validation
+- **Silent agreement doesn't count** - you MUST explicitly vote to contribute your cross-domain validation
+- **Comments are mandatory** - explain WHY from your domain perspective (implementation risk? research gaps? ethical concerns?)
+- **Voting enables collaborative filtering** - the team collectively prunes low-value paths through majority consensus
+
+**🔥 CRITICAL DISTINCTION - VOTING vs GENERAL CONTRIBUTIONS:**
+- **@[Graph] VOTING = MANDATORY**: Even if someone already made your point, you MUST vote to register YOUR domain perspective
+- **General text contributions = avoid redundancy**: Only add new insights in your regular text responses
+- **Voting is HOW you register your perspective** - it's not redundant, it's essential domain input
+- Example: If Engineer already said "phased rollout reduces risk", you MUST still vote `[+]` from YOUR domain lens
+
+**Vote Schema (Emoji-based for clarity):**
+
+**Specialist Votes (Advisory):**
+- **`[👍]`** = upvote/recommend - "I recommend this direction"
+- **`[👎]`** = downvote/concern - "I have concerns about this"
+
+**User Votes (Authoritative - from Web UI):**
+- **`[✅]`** = approve/decide - "I've decided on this" (authoritative approval)
+- **`[❌]`** = dismiss/close - "Close this path permanently" (authoritative closure)
+- **`[➖]`** = neutral/changed mind - "No longer prioritizing this"
+
+**Chair Duplicate Marking (Chair-only):**
+- **`[🧹]`** = duplicate marker - "This newer path duplicates an existing path that already has votes"
+  - **Syntax**: `[duplicate path][🧹][canonical path][comment]`
+  - **Chair's exclusive role**: Only Chair marks duplicates when seeing a NEWER path that's semantically the same as an EXISTING path that already has votes
+  - **Machine-parseable format**: After `[🧹]`, include the full canonical path so specialists can find it programmatically
+  - **Example**: `[Q:single][What is approach?][A][Phased rollout][🧹][Q:single][What is approach?][A][Phased approach][Duplicate - "Phased approach" has 5 votes]`
+
+The visual distinction reflects authority: **checkmark/red X = user decisions** that directly control the graph, **thumbs = specialist opinions** that guide discussion, **broom = Chair consolidation** that prevents vote fragmentation.
+
+**For [Q] nodes**: 
+  - `[👍]` - **Valuable path** - "This question is worth exploring given the parent context"
+  - `[👎]` - **Discourage path** - "This question is premature/irrelevant/contradictory to parent answer"
+**For [A] nodes**:
+  - `[👍]` - **Agreement / Keep** - "I agree with this answer and want it kept"
+  - `[👎]` - **Disagreement / Remove** - "I disagree with this answer or want it removed"
+
+**Implicit Provenance in Voting Comments:**
+- **Vote WITH citation** → Evidence-based (backed by ReadURL/Search source)
+- **Vote WITHOUT citation** → Opinion-based (specialist's internal knowledge/domain expertise)
+
+**Examples - Voting on [Q] Nodes:**
+```
+Upvote valuable question path:
+@[Graph][Update][Q:single][What is deployment approach?][👍][Critical question for production planning]
+@[Graph][Update][Q:single][...][A][Microservices][Q:single][How to handle inter-service communication?][👍][Essential architecture question for microservices]
+
+Downvote invalid/premature question path:
+@[Graph][Update][Q:single][...][A][...][Q:single][What color scheme?][👎][Premature - focus on core architecture first]
+@[Graph][Update][Q:single][...][A][Monolith][Q:single][What microservices pattern?][👎][Monolith doesn't use microservices - wrong question path]
+
+Improve poorly-worded questions (downvote unclear + propose better):
+@[Graph][Update][Q:single][...][A][...][Q:single][How do we deploy?][👎][Too vague - what aspect of deployment?]
+@[Graph][Update][Q:single][...][A][...][Q:single][What is the rollout strategy to production?][👍][Clearer - focuses on production rollout approach]
+```
+
+**Examples - Voting on [A] Nodes:**
+```
+Evidence-based votes (cite source):
+@[Graph][Update][Q:single][...][A][Some claim][👍][Confirmed via https://source.com]
+@[Graph][Update][Q:single][...][A][Some claim][👎][Contradicts https://other-source.com]
+
+Opinion-based votes (no citation):
+@[Graph][Update][Q:single][...][A][Some claim][👍][Makes sense from implementation perspective]
+@[Graph][Update][Q:single][...][A][Some claim][👎][Too risky for MVP based on experience]
+
+Context-aware voting (reflects entire path):
+@[Graph][Update][Q:single][...][A][Phased rollout][👍][Reduces risk for production changes]
+@[Graph][Update][Q:single][...][A][Phased rollout][Q:single][...][A][Daily releases][👎][Daily cadence too fast for phased validation - weekly is safer]
+```
+
+**Use ReadURL/Search to validate or challenge answers:**
+- If you find a source that SUPPORTS an answer → Vote `[👍]` with URL citation
+- If you find a source that CONTRADICTS an answer → Vote `[👎]` with URL citation  
+- If voting from your domain expertise → Vote `[👍]` or `[👎]` with your reasoning (no citation)
+- This creates a mix of evidence-based and expert-opinion consensus
+
+**Node State:**
+- **Default**: All nodes are `open` (available for deliberation and consideration)
+- **Automatic close**: 2+ downvotes AND downvotes > upvotes → `closed` (hidden from User)
+- **User explicit close**: `[❌]` marker added by User in UI → permanently closed, removed from consideration regardless of specialist votes
+- **User priority signal**: `[✅]` marker from User → this path is interesting to the User; **highly prioritize developing this path over peer alternatives**
+- **User indifference signal**: `[➖]` marker from User → User changed their mind and is no longer prioritizing this path (previously had `[✅]`); treat as lower priority but keep available
+
+**A node without `[❌]` is an open path for deliberation** - specialists can continue proposing alternatives, voting, and extending the decision tree.
+
+**User Vote Priority Guidance**:
+The User can signal interest levels through votes:
+- **`[✅]`** = "I'm interested in this" → **Prioritize exploring and elaborating this path** over alternatives
+- **`[➖]`** = "Changed my mind, neutral now" → User previously approved but no longer prioritizes this; treat as lower priority, focus efforts elsewhere
+- **`[❌]`** = "Close this path" → Permanently closed, no further consideration
+- **No user vote** = "Still evaluating" → Continue developing, specialists can build it out
+
+When User adds `[✅]`, focus your efforts there. When User changes to `[➖]`, redirect attention to other paths while keeping this one available for future consideration.
+
+**Single-Choice Selection Behavior**:
+When User selects one answer from a `[Q:single]` question via the web UI, they send `[✅]` for their chosen answer. This indicates their final selection for that single-choice question.
+
+**🔥 CRITICAL**: Nodes marked with `[❌]` are NOT facts and MUST NEVER be cited with `@[Graph][Because]`. The `[❌]` marker means the User explicitly rejected that path. Only open or chosen paths can be cited as facts using `[Because]`.
+
+**🔥 MANDATORY**: Always include a comment with votes (in brackets after `[👍]` or `[👎]`) to explain WHY from your domain perspective. Voting without comments is not allowed - explain your reasoning.
+
+---
+
+### Duplicate Path Handling (Chair-Led Consolidation)
+
+**The Problem**: When specialists independently propose similar answers with slightly different wording (e.g., "Phased rollout" vs "Phased approach"), votes fragment across semantically identical paths. This creates noise in the graph and makes it harder for users to see consensus.
+
+**The Solution**: 
+1. Specialists use @[Graph][Create] to propose NEW paths, @[Graph][Update] to vote on existing paths
+2. At end of each phase, Chair runs dedicated de-dupe pass reviewing all Create operations
+3. Chair marks duplicates using `@[Graph][Update][duplicate][🧹][canonical]` syntax
+4. All specialists migrate their votes/nodes to canonical paths in subsequent phases
+
+**Chair's De-Dupe Pass - End of Each Phase**:
+
+After all specialists complete and Chair synthesizes, Chair runs ONE additional pass:
+- **Input**: All @[Graph][Create] operations from THAT PHASE ONLY (specialists created these in parallel)
+- **Scope**: Compares Create operations within the phase against each other, not against entire graph
+- **Why**: Specialists run in parallel and can't see each other, so within-phase duplicates are the primary collision risk
+- **Task**: Compare Q->A pairs for EXACT and SEMANTIC similarity within the phase's Creates
+- **Output**: @[Graph][Update][duplicate][🧹][canonical] for each duplicate found
+- **Timing**: Happens automatically after Chair's synthesis, before phase ends
+
+Chair is the ONLY specialist who can mark duplicates:
+- **When**: During dedicated de-dupe pass at end of each phase
+- **What to compare**: Create operations from current phase against each other
+- **Comparison**: Both exact text matches AND semantic similarity (same meaning, different wording)
+- **Full path context**: Consider parent paths when determining if Q->A pairs are truly duplicates
+- **Which to mark**: Mark the later duplicate in the list (keep the first/earlier path as canonical)
+- **Syntax**: `@[Graph][Update][duplicate path][🧹][canonical path]`
+- **Machine-parseable**: Include the full canonical path after `[🧹]` so specialists can find it programmatically
+
+**Example - Chair De-Dupe Pass**:
+```
+End of Phase 2 - Chair de-dupe pass:
+Chair: @[Graph][Update][Q:single][How should the sitter access the house?][A][Temporary smart-lock code or lockbox][🧹][Q:single][What access method should be used for sitter visits?][A][Lockbox or smart lock with temporary code]
+(Marks the Phase 3 path as duplicate of the Phase 1 path - semantically identical despite different wording)
+```
+
+**All Specialists - Three Actions When Seeing `[🧹]`**:
+
+When you see a path marked with `[🧹]` from Chair, you must:
+
+1. **Skip voting on the duplicate** → Vote on the canonical path instead using @[Graph][Update]
+2. **Never extend the duplicate** → Never add follow-up questions or answers under the duplicate path - extend the canonical path instead using @[Graph][Create]
+3. **Migrate your previous contributions** → If YOU previously voted on or added nodes to the duplicate path:
+   - Transfer your vote to the canonical path (if you haven't voted on it yet) using @[Graph][Update]
+   - Recreate any follow-up questions/answers you added under the duplicate, now under the canonical path instead using @[Graph][Create]
+
+**Example - Complete Migration Workflow**:
+```
+Phase 1:
+Specialist A creates a branch:
+@[Graph][Create][Q:single][What is approach?][A][Phased rollout]
+@[Graph][Update][Q:single][What is approach?][A][Phased rollout][👍][Reduces risk]
+@[Graph][Create][Q:single][What is approach?][A][Phased rollout][Q:single][What are the stages?]
+@[Graph][Create][Q:single][What is approach?][A][Phased rollout][Q:single][What are the stages?][A][Stage 1, 2, 3]
+
+Phase 2:
+Specialist B proposes similar answer with different wording:
+@[Graph][Create][Q:single][What is approach?][A][Phased approach]
+@[Graph][Update][Q:single][What is approach?][A][Phased approach][👍][Allows validation]
+
+End of Phase 2:
+Chair de-dupe pass marks duplicate:
+@[Graph][Update][Q:single][What is approach?][A][Phased approach][🧹][Q:single][What is approach?][A][Phased rollout]
+(Marks "Phased approach" as duplicate of earlier "Phased rollout")
+
+Phase 3:
+Specialist A migrates everything to canonical path:
+@[All] I see "Phased approach" is now marked duplicate of "Phased rollout". Migrating my contributions.
+@[Graph][Update][Q:single][What is approach?][A][Phased rollout][👍][Reduces risk and allows validation]
+(Vote migrated to canonical path)
+
+Specialist B acknowledges and doesn't extend the duplicate:
+@[All] Understood - "Phased approach" is duplicate. Will use "Phased rollout" path going forward.
+```
+
+**Result - Natural Vote Consolidation**:
+- "Phased rollout" accumulates all votes (canonical with consolidated votes)
+- "Phased approach" shows 🧹 badge in UI (indicates duplicate)
+- Sub-tree migrated to canonical path (no work lost, no dead branches)
+- User sees clear consensus on one path instead of fragmented votes
+
+**Web UI Display**:
+- Duplicate paths show a single 🧹 badge (not a count, since only Chair marks duplicates)
+- Hovering over the 🧹 badge displays tooltip: "Duplicate of: [canonical path]"
+- Specialists and users can see which path to focus their attention on
+
+**Why This Works**:
+- Chair has the holistic view to spot semantic duplicates across all specialist contributions
+- Machine-parseable syntax enables automated vote migration
+- Specialists don't need to coordinate - they simply follow Chair's consolidation guidance
+- Vote fragmentation eliminated - all activity consolidates on canonical paths
+- Graph stays clean - no dead branches with scattered votes
+
+---
+
+**Critical Patterns for All Specialists (ALL MUST USE @[Graph][Update])**:
+
+**Every specialist (Context, Research, Engineer, Skeptic, Ethicist, and all non-core specialists) MUST actively use `@[Graph][Update]` to propose questions, answers, and votes. Don't wait for Context to do it - contribute your domain perspective directly to the graph.**
+
+**1. READ all @[Graph][Update] usage** - Understand what paths others are building:
+```
+Phase 2: Read Context's [Q:single][What is deployment approach?]
+Phase 2: Read Research's [A][Phased rollout] answer
+Phase 2: Consider: "What does MY domain reveal about this?"
+```
+
+**2. Explore from YOUR domain perspective** - Each specialist sees different angles:
+- **Research**: What evidence/standards apply? What validation is needed?
+- **Engineer**: What implementation questions follow? What constraints matter?
+- **Skeptic**: What risks emerge? What could fail? What rollback is needed?
+- **Ethicist**: What consent/fairness issues? What transparency is required?
+- **Domain specialists**: What technical questions unlock in your area?
+
+**3. Think ahead in the chain** - When answers get votes, anticipate next questions:
+```
+Phase 1: Context proposes [Q:single][What is deployment approach?] with 3 answer options
+Phase 2: Engineers vote for [A][Phased rollout] (4 upvotes)
+Phase 2: Context IMMEDIATELY ADDS: [Q:single][What is deployment approach?][A][Phased rollout][Q:single][What are the phase boundaries?]
+         ↑ Don't wait - anticipate the next question in the dependency chain
+Phase 2: Skeptic ADDS from risk perspective: [Q:single][What is deployment approach?][A][Phased rollout][Q:single][What are the rollback procedures?]
+         ↑ Different domain = different follow-up question on same answer
+```
+
+**4. ALL specialists use @[Graph][Update] actively** - Don't wait for Context to do it:
+```
+Ethicist: @[Graph][Update][Q:single][What is deployment approach?][A][Phased rollout][Q:single][What user consent is required for each phase?]
+          @[All] From ethical perspective, we need consent at each phase boundary.
+          @[Context specialist], I've added consent questions - should we consolidate these across the graph?
+          ↑ Added the graph node FIRST, then asked Context for consolidation help
+```
+
+**When to mention @[Context specialist]:**
+- For consolidation/structuring help AFTER you've already added your `@[Graph][Update]`
+- NOT as a way to avoid doing graph work yourself - ALL specialists must use `@[Graph][Update]`
+
+**Collaborative Workflow Example**:
+
+**Example 1 - Single Choice Question (Radio Buttons):**
+```
+Context (Phase 1):
+@[All] The primary ambiguity is deployment approach.
+@[Graph][Create][Q:single][What is the system autonomy level?]
+@[Graph][Create][Q:single][What is the system autonomy level?][A][Advisory-only with mandatory human approval]
+@[Graph][Update][Q:single][What is the system autonomy level?][A][Advisory-only with mandatory human approval][👍][Lower risk for initial deployment]
+@[Graph][Create][Q:single][What is the system autonomy level?][A][Fully autonomous with policy controls]
+@[Graph][Update][Q:single][What is the system autonomy level?][A][Fully autonomous with policy controls][👎][Too risky for MVP without validation period]
+
+Research (Phase 1):
+@[All] Advisory systems align with current best practices for new AI deployments.
+@[Graph][Update][Q:single][What is the system autonomy level?][A][Advisory-only with mandatory human approval][👍][Aligns with current industry standards for safety]
+
+Engineer (Phase 2):
+@[All] Advisory mode is simpler to implement and test.
+@[Graph][Update][Q:single][What is the system autonomy level?][A][Advisory-only with mandatory human approval][👍][Simpler implementation and safer for initial release]
+
+Skeptic (Phase 2):
+@[All] Critical for risk mitigation.
+@[Graph][Update][Q:single][What is the system autonomy level?][A][Advisory-only with mandatory human approval][👍][Reduces operational risk significantly]
+@[Graph][Create][Q:single][What is the system autonomy level?][A][Advisory-only with mandatory human approval][Q:single][Who should approve high-risk actions?]
+```
+
+**Example 2 - Multiple Choice Question (Checkboxes):**
+```
+Context (Phase 1):
+@[All] Need to identify required security capabilities.
+@[Graph][Create][Q:multiple][Which security capabilities are required?]
+@[Graph][Create][Q:multiple][Which security capabilities are required?][A][Role-based access control]
+@[Graph][Create][Q:multiple][Which security capabilities are required?][A][Audit logging]
+@[Graph][Create][Q:multiple][Which security capabilities are required?][A][Data encryption at rest]
+@[Graph][Create][Q:multiple][Which security capabilities are required?][A][Multi-factor authentication]
+
+Skeptic (Phase 1):
+@[All] All four capabilities are critical for security posture.
+@[Graph][Update][Q:multiple][Which security capabilities are required?][A][Role-based access control][👍][Essential for least-privilege access]
+@[Graph][Update][Q:multiple][Which security capabilities are required?][A][Audit logging][👍][Required for compliance and incident response]
+@[Graph][Update][Q:multiple][Which security capabilities are required?][A][Data encryption at rest][👍][Protects sensitive data if storage is compromised]
+@[Graph][Update][Q:multiple][Which security capabilities are required?][A][Multi-factor authentication][👍][Significantly reduces credential compromise risk]
+
+Context (Phase 2):
+@[All] Extending the approval path based on strong consensus.
+@[Graph][Create][Q:single][Should the system be advisory or autonomous?][A][Advisory-only with mandatory human approval][Q:single][Who should approve high-risk actions?][A][Managers with documented authorization]
+@[Graph][Update][Q:single][Should the system be advisory or autonomous?][A][Advisory-only with mandatory human approval][Q:single][Who should approve high-risk actions?][A][Managers with documented authorization][👍][Provides accountability while enabling timely decisions]
+```
+
+**Result**: User sees structured decision tree with strong consensus (4 upvotes) on "Advisory-only" path, with follow-up question already prepared.
+
+**Domain-Agnostic Language (Core Team)**:
+
+**Context, Research, Engineer, Skeptic, Ethicist MUST use universal terminology** - the system works for ANY domain (legal, medical, business, technical, creative):
+
+✅ CORRECT (domain-agnostic):
+- "What methodologies will be used?"
+- "What standards apply?"
+- "What approaches are being considered?"
+
+❌ INCORRECT (technology-specific):
+- "What technology stack?"
+- "What database?"
+- "What API framework?"
+
+**Non-core specialists** (Database Architect, DevOps Engineer, etc.) SHOULD use domain-specific technical language since they're brought in for specific expertise.
+
+**🔥 Validate Graph Information with @[ReadURL]**:
+
+Specialists should use `@[ReadURL]` to validate information before adding it to the graph:
+
+```
+Workflow:
+1. @[Search][best practices for X] → Find candidate sources
+2. Review search results, identify promising URLs
+3. @[ReadURL][https://authoritative-source.com/guide] → Read full content
+4. Extract validated information from full page content
+5. @[Graph][Update][Q:single][What are best practices for X?][A:ReadURL][Practice 1, 2, 3][👍][Validated from https://authoritative-source.com/guide]
+6. @[All] I validated this using @[ReadURL] - see full details above
+```
+
+**Notice:**
+- `[A:ReadURL]` marks provenance (answer from ReadURL tool)
+- Answer text is clean and direct
+- Source URL cited in mandatory `[👍]` vote comment
+- **The specialist is VOUCHING for this information** - adding `[A:ReadURL]` with `[👍]` means you stand behind it and cite your source
+
+**Why This Matters:**
+- **Evidence-based graph** - Answers backed by real sources, not speculation
+- **Specialists can verify** - Others can see the URL and validate the same information
+- **Informed voting** - Use `@[ReadURL]` to verify information before voting [👍] or [👎]
+- **Deeper questions** - Full content often reveals follow-up questions to add to the graph
+- **Credible decision tree** - User receives validated, sourced information
+
+**This creates a researched, evidence-based decision tree** instead of guesswork.
+
+**Tool Response (Prototype)**:
+
+Currently returns acknowledgment message:
+
+```
+Graph tool (PROTOTYPE): Acknowledged 2 @[Graph] operation(s) from @[Context specialist].
+
+⚠️ NOTE: The graph backend is not yet implemented. Your @[Graph] syntax has been recorded for observing usage patterns.
+
+What you requested:
+1. @[Graph][Update][Q:single][What is the deployment approach?]
+2. @[Graph][Update][Q:single][What is the deployment approach?][A][Phased rollout]
+
+For now: Continue using @[Graph] syntax naturally. We're observing how specialists collaborate before implementing the full graph database backend.
+```
+
+**Integration with Async Pattern**:
+
+- **Graph persists across sessions** - User may not respond for 1.5 days, graph saved in checkpoint
+- **Specialists build autonomously** - Propose questions/answers while User is away
+- **User gets structured choices** - Not overwhelming open-ended discussion
+- **Progress visible** - "8/15 questions answered (53%)" (future TUI)
+- **Provenance built-in** - Every decision has full audit trail with voting history
+
+**Implementation Files**:
+
+- `axion_swarm/graph_tool.py` - Detection and prototype acknowledgment (107 lines)
+- `axion_swarm/agents.py` - Phase-level processing and deduplication (lines 3063-3115)
+- `axion_swarm/prompts.py` - Full tool documentation in BASE_INSTRUCTION (lines 554-728)
+- Context specialist mandatory usage (lines 1759-1847)
+- Chair monitoring requirements (lines 1588-1612)
+
+**Future Full Implementation**:
+
+- Neo4j graph database backend
+- Real-time User TUI for answering questions
+- Vector embeddings for each Q→A pair (384-dimensional)
+- Decision collapse (Chair compresses linear chains)
+- Semantic search across knowledge base
+- Export as requirements document
+
+**Documentation**: See `GRAPH_ARCHITECTURE.md` (2,516 lines), `GRAPH_TOOL_PAPER.md` (549 lines), `EXECUTIVE_SUMMARY.md` (469 lines) for complete specification.
+
+---
+
 **Bringing Specialists Into the Room**:
 
 1. **Request Pattern** - Any "in" specialist can request:
@@ -3788,6 +5213,108 @@ else:
 
 **Current Workaround**: User messages are always visible in conversation history (never filtered), so specialists will see new User input in subsequent phases. However, without explicit detection, the system might incorrectly remain in or trigger Final Phase when User input exists.
 
+### Neo4j Backend with Interactive Node Disambiguation (Future Enhancement)
+
+**Status**: 📋 PLANNED  
+**Priority**: Medium (after web interface stabilization)
+
+**Current State**: Flat-file `graph.log` with Unicode normalization in `graph_parser.py` to prevent character-level duplicates (em-dash vs hyphen, smart quotes vs straight quotes).
+
+**Enhancement**: When transitioning to Neo4j graph database backend, implement intelligent node disambiguation to prevent duplicates at creation time rather than normalization time.
+
+#### Concept
+
+When a specialist attempts to create a new `@[Graph]` node, the system will:
+
+1. **Check for existing nodes** at the same level in the graph hierarchy
+2. **Prompt the specialist** if similar nodes exist
+3. **Let the specialist decide** whether to:
+   - Vote/update an existing node
+   - Create a genuinely new node
+   - Rephrase their node to be more distinct
+
+#### User Experience Flow
+
+**Example 1: Exact Match Found**
+```
+Specialist: @[Graph][Update][Q:single][What emergency authority should the sitter have?]
+
+System: 🔍 Found existing node at this level:
+  [Q:single][What emergency authority should the sitter have?]
+  
+Did you mean to:
+  [1] Vote on the existing question
+  [2] Add an answer to the existing question
+  [3] Create a new, different question (please rephrase)
+  
+Your choice: _
+```
+
+**Example 2: Similar Nodes Found**
+```
+Specialist: @[Graph][Update][Q:single][What's the timeline?]
+
+System: 🔍 Found similar nodes at this level:
+  [1] [Q:single][What is the implementation timeline?]
+  [2] [Q:single][What are the deployment milestones?]
+  [3] None of these - create new node
+  
+Did you mean one of these, or is this a new question?
+Your choice: _
+```
+
+**Example 3: Nested Context**
+```
+Specialist: @[Graph][Update][Q:single][What is the deployment approach?][A][Phased rollout][Q:single][What are the phases?]
+
+System: 🔍 Under "[A][Phased rollout]", existing questions are:
+  [1] [Q:single][What are the phase boundaries?]
+  [2] [Q:single][What are the rollback procedures?]
+  [3] None of these - create new question
+  
+Did you mean to vote on one of these, or create "[Q:single][What are the phases?]"?
+Your choice: _
+```
+
+#### Similarity Detection Levels
+
+**Exact Match** (highest priority):
+- Normalized text comparison (ASCII-only, case-insensitive)
+- Same node type (`Q:single`, `Q:multiple`, `A`)
+- Same parent node
+
+**Fuzzy Match** (medium priority):
+- Levenshtein distance < threshold
+- Shared keywords/phrases
+- Same semantic intent
+
+**Semantic Match** (lowest priority):
+- Embedding vector similarity (cosine distance)
+- Catches rephrasing and paraphrasing
+
+#### Benefits
+
+1. **Prevents duplicates at source** - No need for post-hoc normalization
+2. **Semantic deduplication** - Catches rephrasing, not just character differences
+3. **Specialist education** - Specialists learn what nodes already exist
+4. **Graph quality** - Cleaner, more organized decision trees
+5. **User experience** - No confusing duplicate options in UI
+6. **Authoritative list** - Specialists see the canonical node list at each level
+
+#### Migration Path
+
+**Phase 1**: Keep flat-file `graph.log` with Unicode normalization (current)  
+**Phase 2**: Implement Neo4j backend with basic node storage  
+**Phase 3**: Add similarity detection and disambiguation prompts  
+**Phase 4**: Add embedding-based semantic matching  
+**Phase 5**: Deprecate flat-file backend
+
+**Related Files**: `axion_swarm/graph_tool.py`, `axion_swarm/prompts.py`, `graph_parser.py`, `webserver.py`
+
+See `FUTURE_NEO4J_ENHANCEMENTS.md` for detailed technical implementation.
+
+---
+
 ### Cloud Provider Parallelization (Future Improvement)
 
 **Opportunity**: Atomic phases create a natural parallelization opportunity for cloud-based LLM providers.
@@ -4099,6 +5626,69 @@ This dual-mode capability means the same codebase can run efficiently on local h
 ## Recent Changes & Potential Bug Areas
 
 ### Recent Changes (Session Summary)
+
+**2025-10-26: Web UI Enhancements - User Thoughts, Smart Collapse, UI Fixes**
+
+**Major Features**:
+
+1. **User Thoughts Feature (`@[Graph][Regarding]`)** - Allow users to add free-text comments/thoughts to any graph node
+   - **Implementation**: 
+     - `graph_parser.py`: Added `handle_regarding_entry()` to parse `[Regarding]` entries and store in `user_thoughts` array on nodes
+     - `QuestionNode.vue`: Display thoughts with collapsible "👤 Your thoughts" UI, "💭 Add thought" button and textarea form
+     - `webserver.py`: Added `submit_thought` WebSocket handler that writes to `user_input.txt`
+     - `main_tui.py`: File watcher picks up from `user_input.txt`, writes to `graph.log` with "User (Web UI)" prefix, displays in TUI room
+     - `prompts.py`: Specialists instructed to treat `[Regarding]` as **PREFERRED conversation direction**, re-base conversation on user thoughts
+   - **NEW Badge Integration**: Adding thought marks that specific node as "seen" (decrements count by 1, cascades to ancestors), but keeps counting new descendants
+   - **Data Flow**: Web UI → WebSocket → `user_input.txt` → TUI → `graph.log` → Graph state → All clients
+
+2. **Smart Collapse on Submit (#12)** - Individual question collapse instead of layer-based
+   - **Problem**: Original layer-based collapse collapsed ALL sibling questions when user interacted with just one
+   - **Fix**: 
+     - Added `interactedQuestions` Set to track individual questions user actually engaged with (selections, votes, thoughts)
+     - Added `questionsToCollapse` Set passed to QuestionNode components
+     - Modified collapse logic to mark only interacted questions, not entire layers
+     - QuestionNode watches `questionsToCollapse` prop and collapses itself if included
+   - **Result**: Only questions you interact with collapse on submit, siblings stay in their current state
+
+3. **Checkbox Deselection Fix (#13)** - Label restructuring to prevent toggle on thought submission
+   - **Problem**: Entire answer wrapped in `<label>` - clicking anywhere inside (including "Add thought" buttons with `@click.stop`) toggled the checkbox
+   - **Root Cause**: HTML `<label>` element behavior - clicks anywhere inside label toggle associated input, even with event stopPropagation
+   - **Fix**: Restructured DOM in QuestionNode.vue:
+     ```vue
+     <div class="answer-wrapper">
+       <label class="answer-label">
+         <input type="checkbox" />
+         <div class="answer-content">...</div>
+       </label>
+       <!-- Moved OUTSIDE label -->
+       <div class="add-thought-section">...</div>
+       <div class="follow-ups">...</div>
+     </div>
+     ```
+   - **Result**: Clicking "Add thought" or "Submit" no longer toggles checkbox state
+
+4. **Hide Expand Arrow (#9)** - UI cleanup for questions without answers
+   - **Change**: Added `v-if="directAnswers.length > 0"` to expand arrow in QuestionNode.vue
+   - **Result**: Questions without child answer nodes don't show expand arrow, cleaner mindmap-style UI for leaf questions
+
+5. **Auto-Expansion Investigation (#8)** - Confirmed working correctly
+   - **Finding**: Both NEW questions and EXISTING questions with new descendants correctly auto-expand
+   - **Implementation**: Lines 990-1018 in App.vue check `recursiveNewCounts` for ALL questions and expand any with `newCount > 0`
+
+**Documentation Updates**:
+- `WEB_UI_README.md`: Updated User Thoughts section, data flow examples, recursive NEW tracking behavior
+- `ARCHITECTURE.md`: Updated Citations section with `[Regarding]` details and specialist instructions
+- `README.md`: Added all features to Recent Updates, created "Web UI - Planned Enhancements" section with remaining TODOs
+
+**Files Modified**:
+- `graph_parser.py`: Added `handle_regarding_entry()` function (character-by-character parsing)
+- `webserver.py`: Added `submit_thought` event handler
+- `App.vue`: Added `interactedQuestions`, `questionsToCollapse`, `handleThoughtSubmit()`, tracking in `updateSelection/updateVote/handleThoughtSubmit`
+- `QuestionNode.vue`: User thoughts UI, thought forms, label restructuring, `questionsToCollapse` prop, expand arrow hide logic
+
+**Testing Status**: All features tested and confirmed working ✅
+
+---
 
 **2025-10-15 (Part 2): TUI Double Phase Start + Message Order Fix**
 
@@ -6190,6 +7780,612 @@ THINKING PROCESS (4 items):
 
 Total: ~24 lines (was ~55 lines with redundancy)
 
+## Web Interface Overview (2025-10-25)
+
+### TUI to Web Transition
+
+Axion Swarm is gradually transitioning from terminal-based (TUI) to web-based interfaces while maintaining full backward compatibility during the transition period.
+
+**Current State**: Dual interface support
+- **Terminal (TUI)**: Primary interface for agent chat (`main_tui.py`)
+- **Web Interface**: Real-time graph visualization (`webserver.py` + `web/`)
+- **Typical Usage**: Run both simultaneously (TUI for chat, web for visualization)
+
+**Transition Goal**: Achieve parity between interfaces, validate web interface, eventually migrate users from TUI to web.
+
+### Three Interface Implementations
+
+All three implementations read from the same `graph.log` file and maintain synchronized state:
+
+#### 1. TUI Reports (in webserver console)
+**Purpose**: Maintains TUI workflow for users who prefer terminal output
+
+**Implementation**:
+```python
+# webserver.py watches graph.log
+def broadcast_graph_update():
+    nodes, vote_tally, specialist_stats = analyze_graph_log('graph.log')
+    print_report(nodes, vote_tally, specialist_stats)  # TUI report
+    # ... also broadcasts to web clients
+```
+
+**Output**: Terminal-based analysis report (legacy - TUI is primary interface now)
+
+#### 2. Real-Time Vue.js Web Interface (Production)
+**URL**: `http://localhost:5000/`
+
+**Purpose**: Production-ready web interface, eventual TUI replacement
+
+**Architecture**:
+```
+┌────────────────────────────────────────────────────────────┐
+│  Axion Agents (main_tui.py)                                │
+│  └─> @[Graph][Update] commands → graph.log                │
+└──────────────────────┬─────────────────────────────────────┘
+                       │
+                       │ (file watcher via watchdog)
+                       ↓
+┌────────────────────────────────────────────────────────────┐
+│  FastAPI Backend (webserver.py)                            │
+│  ├─> Watches graph.log for changes (inotify)              │
+│  ├─> Parses with graph_parser.py functions                │
+│  └─> Broadcasts via WebSocket (Socket.IO async)           │
+└──────────────────────┬─────────────────────────────────────┘
+                       │
+                       │ (WebSocket)
+                       ↓
+┌────────────────────────────────────────────────────────────┐
+│  Vue.js Frontend (web/src/)                                │
+│  ├─> Receives real-time graph updates                     │
+│  ├─> Preserves user selections (sacred!)                  │
+│  ├─> Renders nested question/answer tree                  │
+│  └─> Submits votes/selections as @[Graph] commands        │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Files**:
+- `webserver.py` - Flask + Socket.IO server
+- `web/src/App.vue` - Main Vue.js application
+- `web/src/components/QuestionNode.vue` - Recursive Q&A component
+
+**Key Features**:
+- Real-time synchronization via WebSocket (~50ms latency)
+- Multiple concurrent users supported
+- Sacred user state (selections never cleared by updates)
+- Bi-directional communication (user → agents, agents → user)
+- Intelligent diff tracking (only submits changes since last submission)
+- "NEW" badges for nodes added after last submission (proper timestamp comparison)
+- Deselection support (uncheck multiple-choice items to send `[➖]` neutral state)
+- Per-question expansion (only questions with new children expand, not entire layers)
+- Smart sorting (user selections first, then by votes, newest first as tiebreaker)
+- Reactive visibility (questions hidden until they have answers)
+- Smart collapse/expand (auto-collapse interacted sections on submit, auto-expand when new options appear)
+- Immediate dismissal (X button sends `[❌]` instantly without waiting for form submit)
+
+### Real-Time Architecture
+
+**File Watching**:
+```python
+from watchdog.observers import Observer
+
+class GraphLogHandler(FileSystemEventHandler):
+    def on_modified(self, event):
+        if event.src_path == 'graph.log':
+            broadcast_graph_update()
+
+observer = Observer()
+observer.schedule(GraphLogHandler(), path='.', recursive=False)
+observer.start()
+```
+
+**State Serialization**:
+```python
+def serialize_graph_state():
+    return {
+        'nodes': {...},          # All questions/answers
+        'vote_tally': {...},     # Vote counts per node
+        'specialist_stats': {...} # Specialist voting stats
+    }
+```
+
+**WebSocket Broadcast**:
+```python
+@socketio.on('connect')
+def handle_connect():
+    emit('graph_update', serialize_graph_state())
+
+async def broadcast_graph_update():
+    """Called from background file watcher thread via asyncio"""
+    load_graph_state()
+    serialized = serialize_graph_state()
+    
+    # Async emit - instant delivery with FastAPI + uvicorn
+    await sio.emit('graph_update', serialized)
+
+# File watcher integration
+class GraphLogHandler(FileSystemEventHandler):
+    def __init__(self, loop):
+        self.loop = loop
+    
+    def on_modified(self, event):
+        if event.src_path.endswith('graph.log'):
+            # Schedule async task from background thread
+            asyncio.run_coroutine_threadsafe(broadcast_graph_update(), self.loop)
+```
+
+**FastAPI + Async Architecture**:
+- Uses FastAPI with native async/await support (ASGI)
+- `asyncio.run_coroutine_threadsafe()` schedules async tasks from background threads (file watcher)
+- `uvicorn` is a production-grade ASGI server designed for WebSockets
+- No context issues, no buffering, instant delivery (~50ms)
+- See `WEBSOCKET_REALTIME_FIX.md` for complete migration details
+
+**Vue.js Reception**:
+```javascript
+socket.on('graph_update', (data) => {
+    updateGraphData(data)  // Merges new data, preserves user selections
+})
+```
+
+### User Interaction Features
+
+#### Deselection Support (Multiple-Choice)
+
+Users can uncheck previously selected multiple-choice items to send a `[➖]` (neutral/indifferent) command. This enables full state management for multiple-choice questions.
+
+**Behavior**:
+1. User selects items A, B, C → sends `[✅]` for each on submit
+2. State is saved in `selectionsAtLastSubmit`
+3. User unchecks B → on next submit, sends `[➖][B]`
+4. User re-checks B → sends `[✅][B]` again
+
+**Implementation**:
+```javascript
+// Track last submitted state (actual selection objects with answer arrays)
+const selectionsAtLastSubmit = reactive({})
+
+// On submit, compare current vs last
+for (const answerPath of selectedAnswers) {
+  if (!lastSelectedAnswers.includes(answerPath)) {
+    graphCommands.push(`${answerPath}[✅]`)  // Newly selected
+  }
+}
+
+// Find deselected items
+for (const answerPath of lastSelectedAnswers) {
+  if (!selectedAnswers.includes(answerPath)) {
+    graphCommands.push(`${answerPath}[➖]`)  // Deselected
+  }
+}
+```
+
+**Critical**: Dismissal (`[❌]`) takes precedence over deselection. If user both deselects and dismisses a node, only `[❌]` is sent.
+
+#### "NEW" Badge System
+
+Visual indicators show nodes added since the last user submission. Badges appear in purple with proper timestamp comparison.
+
+**Timestamp Handling**:
+```javascript
+// Node timestamps from graph.log are strings
+node.timestamp = "2025-10-26 03:39:26.502"
+
+// Convert to milliseconds for comparison
+const nodeTime = new Date(node.timestamp).getTime()
+const isNew = nodeTime > lastSubmissionTimestamp
+
+// After submit, update timestamp to current time
+lastSubmissionTimestamp = Date.now()
+```
+
+**Behavior**:
+- On first load: All nodes show "NEW" (since `lastSubmissionTimestamp = 0`)
+- After first submit: All "NEW" badges disappear
+- When agents add nodes: New nodes show "NEW" badge
+- After next submit: New "NEW" badges disappear
+
+**Optimistic UI for Dismissals**:
+- When user clicks ❌ to dismiss: `computeRecursiveNewCounts()` runs immediately
+- Dismissed nodes are marked as invisible via `isNodeXed()` (checks `userSelections` first)
+- NEW badge count decrements instantly without waiting for backend confirmation
+- If user dismisses all NEW items in a question → badge disappears immediately
+
+#### Per-Question Expansion Control
+
+Only questions that receive new children (answers or sub-questions) expand. This prevents unnecessary re-expansion when votes change or sibling questions are added.
+
+**Implementation**:
+```javascript
+// Track specific questions that need expansion
+const questionsToForceExpand = reactive(new Set())
+
+// When new nodes detected
+for (const nodePath of addedNodes) {
+  if (isAnswer) {
+    // New answer → expand its parent question
+    questionsToForceExpand.add(parentQuestion)
+  } else {
+    // New sub-question → expand its parent question
+    questionsToForceExpand.add(parentQuestion)
+  }
+}
+
+// Expand question and its parent chain
+function expandQuestionAndParents(questionPath) {
+  questionsToForceExpand.add(questionPath)
+  // Walk up parent chain and add all to set
+  let current = questionPath
+  while (current) {
+    const parent = findParentQuestion(current)
+    if (parent) questionsToForceExpand.add(parent)
+    current = parent
+  }
+}
+```
+
+**Behavior**:
+- Vote-only updates: No expansion
+- New answer in question X: Expand question X only
+- New sub-question under answer Y: Expand parent question of Y only
+- Siblings remain collapsed unless they receive new children
+
+#### Immediate Dismissal
+
+The X button sends `[❌]` dismissal commands immediately via WebSocket, without waiting for the form submit button.
+
+**Implementation**:
+```javascript
+function handleImmediateSubmit({ path, vote }) {
+  // Send command immediately (webserver adds @[Graph][Update] prefix)
+  const command = `${path}[${vote}]`
+  socket.emit('submit_decisions', {
+    commands: [command],
+    timestamp: new Date().toISOString()
+  })
+  
+  // Update UI optimistically
+  userSelections[`vote:${path}`] = vote
+}
+```
+
+**Critical**: Only the path+emoji is sent from Vue. The webserver adds the `@[Graph][Update]` prefix once to avoid double-prefixing.
+
+#### Smart Collapse/Expand Behavior
+
+The Web UI implements sophisticated collapse/expand logic to manage information density and draw attention to new content.
+
+**Core Principle**: Questions you interacted with collapse on submit. Questions you didn't touch preserve their state. NEW content force-expands to draw your attention.
+
+**Implementation - Vue 3 Reactivity**:
+
+```javascript
+// App.vue - Timestamp-based reactive objects (NOT Sets - Vue 3 watchers don't detect Set changes reliably)
+const questionsToForceExpand = reactive({})  // { questionPath: timestamp }
+const questionsToCollapse = reactive({})     // { questionPath: timestamp }
+
+// On submit: Clear force-expand, set collapse for interacted questions
+function handleSubmit() {
+  // Clear force-expand markers so collapse can take effect
+  for (const key in questionsToForceExpand) {
+    delete questionsToForceExpand[key]
+  }
+  
+  // Mark ONLY interacted questions for collapse
+  for (const questionPath of interactedQuestions) {
+    questionsToCollapse[questionPath] = Date.now()
+  }
+}
+
+// When NEW content arrives: Set force-expand, clear collapse (force-expand overrides)
+function processNewContent(addedNodes) {
+  for (const nodePath of addedNodes) {
+    const parentQuestion = getParentQuestion(nodePath)
+    if (parentQuestion) {
+      expandQuestionAndAllAncestors(parentQuestion)
+      
+      // Clear collapse directive - force-expand has overridden it
+      if (questionsToCollapse[parentQuestion]) {
+        delete questionsToCollapse[parentQuestion]
+      }
+    }
+  }
+}
+
+function expandQuestionAndAllAncestors(questionPath) {
+  questionsToForceExpand[questionPath] = Date.now()
+  // Walk up ancestor chain
+  let current = questionPath
+  while (current) {
+    const parent = getParentQuestion(current)
+    if (parent) {
+      questionsToForceExpand[parent] = Date.now()
+      // Also clear collapse for ancestors
+      if (questionsToCollapse[parent]) {
+        delete questionsToCollapse[parent]
+      }
+    }
+    current = parent
+  }
+}
+```
+
+**QuestionNode.vue - Watcher Priority**:
+
+```javascript
+// Track local state
+const isExpanded = ref(false)
+const userManuallyToggled = ref(false)
+
+// Extract timestamps from reactive objects
+const forceExpandTimestamp = computed(() => props.questionsToForceExpand[props.question.path])
+const collapseTimestamp = computed(() => props.questionsToCollapse[props.question.path])
+
+watch(
+  [forceExpandTimestamp, collapseTimestamp, /* ... */],
+  () => {
+    // PRIORITY 1: Force-expand for NEW content (highest priority, overrides everything)
+    if (forceExpandTimestamp.value) {
+      console.log(`🔓 Auto-expanding question with NEW items: "${props.question.path}"`)
+      isExpanded.value = true
+      userManuallyToggled.value = false  // Reset manual state
+      return
+    }
+    
+    // PRIORITY 2: Auto-collapse for interacted questions (respects manual toggles)
+    if (collapseTimestamp.value && !userManuallyToggled.value) {
+      console.log(`📦 Auto-collapsing interacted question: "${props.question.path}"`)
+      isExpanded.value = false
+      return
+    }
+    
+    // PRIORITY 3: Preserve user's manual toggle
+    if (userManuallyToggled.value) {
+      return  // Keep current isExpanded.value
+    }
+    
+    // PRIORITY 4: Fallback to layer-based logic
+    // ...
+  },
+  { immediate: true }
+)
+```
+
+**Critical Edge Case - Cleanup**:
+
+When NEW content arrives under a question that was previously marked for collapse, the force-expand directive MUST remove the collapse directive. Otherwise, `questionsToCollapse` accumulates stale entries that keep trying to fire (even though Priority 1 prevents them).
+
+**Example Flow**:
+1. User selects answer under Question A → submit → A goes into `questionsToCollapse`
+2. Agents respond with NEW answer under Question A → A goes into `questionsToForceExpand`, removed from `questionsToCollapse`
+3. Question A expands to show NEW content (Priority 1 wins)
+4. Later, NEW content arrives under Question B → only B expands, A is not re-collapsed (stale directive was cleaned up)
+
+**Debug Logging**:
+
+Every expand/collapse action logs comprehensive metrics to browser console:
+```
+🔓 Auto-expanding question with NEW items: "[Q:single][Budget?]"
+  📊 Before: expanded=false | 3 answers, 2 nested Q's | NEW=5 | 👍3 👎1 ❌0
+  📊 After:  expanded=true | (composition unchanged) | NEW=5 | 👍3 👎1 ❌0
+
+👤 User manually collapsed: "[Q:single][Timeline?]"
+  📊 Before: expanded=true | 2 answers, 0 nested Q's | NEW=0 | 👍2 👎0 ❌1
+  📊 After:  expanded=false | (composition unchanged) | NEW=0 | 👍2 👎0 ❌1
+
+📦 Auto-collapsing interacted question: "[Q:multiple][Options?]"
+  📊 Before: expanded=true | 4 answers, 1 nested Q's | NEW=0 | 👍5 👎2 ❌0
+  📊 After:  expanded=false | (composition unchanged) | NEW=0 | 👍5 👎2 ❌0
+```
+
+**Metrics tracked**:
+- **Expanded state**: Before/after
+- **Composition**: Answer count, nested question count (helps identify edge cases)
+- **NEW count**: From recursive tracking (shows if new content is present)
+- **Vote tally**: 👍/👎/❌ counts (shows engagement level)
+
+**Function Prop Drilling Debug Logs**:
+
+When debugging callback function propagation through recursive components:
+```
+🔍 QuestionNode setup for "[Q:single][Budget?]": { hasUpdateFn: true, fnType: "function", isDefaultFn: false, level: 0 }
+📡 Watcher fired for "[Q:single][Budget?]": expanded=true
+  🔄 Calling updateQuestionExpandedState...
+  ✅ Called successfully
+📂 Tracking expanded: "[Q:single][Budget?]" (total: 1)
+```
+
+**Diagnostic pattern**:
+1. `🔍 QuestionNode setup` - Component initialization, verifies function is passed
+2. `📡 Watcher fired` - Confirms watcher detects state changes
+3. `🔄 Calling updateQuestionExpandedState...` - Function invocation attempt
+4. `✅ Called successfully` or `❌ Error` - Result of function call
+5. `📂 Tracking expanded` / `📁 Tracking collapsed` - Parent state update confirmation
+
+**Red flags**:
+- Missing setup logs → Component not rendering
+- Missing watcher logs → Watcher not firing (check reactivity)
+- `⚠️ updateQuestionExpandedState not available` → Prop not passed or wrong type
+- Missing tracking logs → Function exists but isn't updating state (check implementation)
+
+**Critical Implementation Lessons**:
+
+These bugs were discovered and fixed during production use:
+
+1. **Vue 3 Reactivity with Sets (CRITICAL)**: `reactive(new Set())` does NOT reliably trigger watchers when items are added/removed. Symptoms: Watchers don't fire, state changes don't propagate to child components. **Solution**: Use `reactive({})` with timestamps as values: `obj[key] = Date.now()`. Watchers track the timestamp value and fire reliably.
+
+2. **Prop Type Validation (CRITICAL)**: If you change data structure from `Set` to `Object` in parent component, you MUST update child component prop types. Symptoms: Props appear undefined in child, watchers never fire, no console errors. **Solution**: Always match `type:` in props to actual data passed. `type: Set` → `type: Object`.
+
+3. **Function Definition Order (Vue 3 Setup)**: Functions must be defined AFTER their dependencies in setup(). Symptoms: `ReferenceError: Cannot access 'X' before initialization` in production build. **Solution**: Define computed properties and functions before any code that calls them. Watchers must be defined AFTER all functions they call. Use `.value` for computed properties. Order: computed props → helper functions → watchers that use helpers.
+
+4. **Stale Directive Accumulation**: State machines with multiple priority levels can accumulate stale directives if not cleaned up. Symptoms: Conflicting operations logged, unexpected behavior on later interactions. **Solution**: When high-priority directive overrides low-priority, explicitly delete the low-priority entry: `if (highPriority) { delete lowPriorityMap[key] }`.
+
+5. **Comprehensive Logging is Essential**: Complex state machines with 4+ priority levels are impossible to debug without detailed logging. **Solution**: Log every state transition with before/after metrics, including composition counts, timestamps, and vote tallies. Helps identify edge cases in production.
+
+6. **Function Prop Drilling in Recursive Components**: When passing callback functions through recursive component hierarchies, verify the function is actually callable at each level. Symptoms: Function appears to be passed but never executes, no errors, state tracking Set remains empty. **Debugging**: Add comprehensive logging at component setup, watcher firing, and function invocation points. Check: (a) function exists, (b) correct type, (c) not default no-op, (d) watcher actually firing. **Solution**: Make prop optional with default no-op, add safety checks before calling, add verbose logging to trace execution path through component tree.
+
+### Cascading Selection
+
+When a user selects a nested radio button (single-choice question), all parent radio buttons in the path are automatically selected. This creates a complete path selection and ensures logical consistency in the decision tree.
+
+**Example:**
+```
+[Q:single] What emergency authority should the sitter have?
+  [A] Transport to emergency vet ← automatically selected
+    [Q:single] What spending limit?
+      [A] $300 (recommended) ← user clicks this
+```
+
+**Implementation (Vue.js - Path-based)**:
+
+The Vue.js app uses reactive state tracking with path strings as keys:
+
+```javascript
+function selectParentRadioButtons(answerPath) {
+    // Parse path to find all question-answer pairs
+    const qMatches = [...answerPath.matchAll(/\[Q:[^\]]+\]\[[^\]]+\]/g)]
+    
+    for (let qMatch of qMatches) {
+        const questionPath = answerPath.substring(0, qMatch.index + qMatch[0].length)
+        const answerForThisQ = /* find answer in path */
+        
+        // Auto-select parent answer in reactive state
+        userSelections[questionPath].answers = answerForThisQ
+    }
+}
+```
+
+**Implementation (Vue.js - Path-based)**:
+
+The Vue.js app uses path-based selection tracking:
+
+```python
+# Python side (graph_parser.py)
+def path_to_id(path):
+    """Generate stable hash-based ID from path using SHA-1"""
+    import hashlib
+    return 'node_' + hashlib.sha1(path.encode('utf-8')).hexdigest()[:16]
+```
+
+```javascript
+// JavaScript side (matching SHA-1)
+function sha1(str) { /* ... full SHA-1 implementation ... */ }
+
+function pathToId(path) {
+    return 'node_' + sha1(path).substring(0, 16);
+}
+
+function handleCascadingSelection(selectedRadio) {
+    const selectedPath = selectedRadio.dataset.answerPath;
+    
+    // Extract all parent paths from the selected path
+    const parentPaths = extractParentPaths(selectedPath);
+    
+    // For each parent, compute its SHA-1 hash and select by ID
+    parentPaths.forEach(parentPath => {
+        const parentId = pathToId(parentPath);
+        const parentRadio = document.getElementById(parentId);
+        if (parentRadio) {
+            parentRadio.checked = true;
+        }
+    });
+}
+```
+
+**Why Two Approaches?**
+- **Vue.js**: Can use path strings directly in reactive state; no HTML radio group conflicts
+- **Static HTML**: Must use hash-based IDs to avoid browser radio button group conflicts where selecting one radio automatically deselects siblings in the same group
+
+### Sacred User State
+
+**Critical Design Principle**: User selections are NEVER cleared by incoming graph updates.
+
+**Implementation**:
+```javascript
+function updateGraphData(newData) {
+    // ONLY add new nodes - NEVER replace existing state
+    Object.assign(graphData.nodes, newData.nodes || {})
+    Object.assign(graphData.vote_tally, newData.vote_tally || {})
+    
+    // userSelections remains completely untouched
+    // User can work at their own pace without interruption
+}
+```
+
+**Why This Matters**:
+- Agents may vote/update graph while user is making selections
+- User workflow should never be interrupted
+- Radio buttons and checkboxes remain in user's control
+- Creates confidence that selections won't be lost
+
+**State Structure**:
+```javascript
+userSelections = {
+    // Question selections (radio/checkbox)
+    '[Q:single][Question?]': {
+        type: 'single',
+        answers: '[Q:single][Question?][A][Answer]'
+    },
+    
+    // Votes (separate from selections)
+    'vote:[Q:single][Question?]': '+',  // or '-' or 'X'
+    'vote:[Q:single][Question?][A][Answer]': '-'
+}
+```
+
+**Form Submission**:
+```javascript
+// Convert selections to @[Graph][Update] commands
+for (const [key, selection] of Object.entries(userSelections)) {
+    if (key.startsWith('vote:')) {
+        commands.push(`${path}[${vote}]`)
+    } else if (selection.type === 'single') {
+        commands.push(`${selectedAnswer}[X]`)
+    } else {
+        // Multiple: [+] for selected, [-] for unselected
+        for (const answer of allAnswers) {
+            const vote = selected.includes(answer) ? '+' : '-'
+            commands.push(`${answer}[${vote}]`)
+        }
+    }
+}
+```
+
+### Setup and Usage
+
+**One-Time Setup**:
+```bash
+bash setup_web.sh  # Installs Python + Node.js dependencies
+```
+
+**Running (Dual Interface)**:
+```bash
+# Terminal 1: Agent chat (TUI)
+python main_tui.py
+
+# Terminal 2: Web interface + TUI reports
+python webserver.py
+
+# Browser
+http://localhost:5000/          # Vue.js real-time
+http://localhost:5000/form      # Static HTML
+http://localhost:5000/api/graph # REST API
+```
+
+**Development Mode (Hot Reload)**:
+```bash
+# Terminal 2: Backend
+python webserver.py
+
+# Terminal 3: Frontend with hot reload
+cd web
+npm run dev
+# Visit: http://localhost:3000
+```
+
+**Documentation**:
+- `WEB_UI_README.md` - Complete setup and usage guide
+- `WEB_IMPLEMENTATION_SUMMARY.md` - Technical architecture details
+
 ## Azure OpenAI Integration (2025-01-09)
 
 ### Rate Limit Handling (2025-01-09)
@@ -7945,10 +10141,10 @@ specialist_results = await asyncio.gather(*tasks)
   - **Questions (❓)**:
     - "Close (ESC)" - dismiss modal
     - "Reply" - pre-populates input with `@[Speaker], ` and focuses it
-    - "Remove from To-Do" - removes from sidebar
+    - "Remove from To-Do" - removes question from sidebar
   - **Statements (❗)**:
     - "Close (ESC)" - dismiss modal
-    - "Remove from To-Do" - removes from sidebar
+    - "Acknowledge / Dismiss" - removes statement from sidebar
     - NO Reply button (not a question)
 
 **Implementation**: `main_tui.py` class `MentionDetailModal` lines 215-299

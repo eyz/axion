@@ -3,6 +3,8 @@
 
 import asyncio
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -31,6 +33,96 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+# Global queue for web UI commands
+web_ui_commands = []
+web_ui_commands_lock = threading.Lock()
+stop_file_watcher = threading.Event()
+
+
+def watch_user_input_file(filepath='user_input.txt'):
+    """Background thread that watches user_input.txt for web UI submissions using inotify."""
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    
+    file_path = Path(filepath)
+    last_position = 0
+    
+    class UserInputHandler(FileSystemEventHandler):
+        def __init__(self):
+            self.last_position = 0
+        
+        def on_modified(self, event):
+            if event.src_path.endswith(filepath):
+                self.process_file()
+        
+        def on_created(self, event):
+            if event.src_path.endswith(filepath):
+                self.last_position = 0
+                self.process_file()
+        
+        def process_file(self):
+            try:
+                if not file_path.exists():
+                    return
+                
+                current_size = file_path.stat().st_size
+                
+                # If file grew, read new content
+                if current_size > self.last_position:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        f.seek(self.last_position)
+                        new_lines = f.readlines()
+                        self.last_position = f.tell()
+                    
+                    # Process new lines
+                    for line in new_lines:
+                        line = line.strip()
+                        # Skip empty lines and comments
+                        if line and not line.startswith('#'):
+                            with web_ui_commands_lock:
+                                web_ui_commands.append(line)
+                            
+                            # Also append to graph.log
+                            try:
+                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                with open('graph.log', 'a', encoding='utf-8') as f:
+                                    f.write(f"[{timestamp}] User (Web UI) | {line}\n")
+                            except Exception as e:
+                                logger.warning(f"Could not append to graph.log: {e}")
+                            
+                            logger.info(f"Queued command from web UI: {line[:80]}...")
+                
+                # If file shrunk (was cleared), reset position
+                elif current_size < self.last_position:
+                    self.last_position = 0
+            except Exception as e:
+                logger.error(f"Error processing {filepath}: {e}")
+    
+    logger.info(f"[FileWatcher] Started watching {filepath} for web UI submissions (inotify)")
+    
+    event_handler = UserInputHandler()
+    observer = Observer()
+    observer.schedule(event_handler, path='.', recursive=False)
+    observer.start()
+    
+    try:
+        while not stop_file_watcher.is_set():
+            time.sleep(0.1)
+    finally:
+        observer.stop()
+        observer.join()
+    
+    logger.info(f"Stopped watching {filepath}")
+
+
+def get_pending_web_commands():
+    """Get and clear all pending web UI commands."""
+    with web_ui_commands_lock:
+        commands = web_ui_commands.copy()
+        web_ui_commands.clear()
+    return commands
 
 
 # Stderr capture for library messages ([CHAIR], [DEBUG], checkpoints)
@@ -177,6 +269,11 @@ def highlight_mentions(text: str, state: dict = None) -> tuple:
     text_ansi = re.sub(r'@\[Search\]\[([^\]]+)\]', replace_search_ansi, text_ansi, flags=re.IGNORECASE)
     text_rich = re.sub(r'@\[Search\]\[([^\]]+)\]', replace_search_rich, text_rich, flags=re.IGNORECASE)
     
+    # 4.5. Handle @[Graph][...][...][...] patterns with colorization
+    from axion_swarm.colors import colorize_graph_mentions, colorize_graph_mentions_rich
+    text_ansi = colorize_graph_mentions(text_ansi)
+    text_rich = colorize_graph_mentions_rich(text_rich)
+    
     # 5. Handle regular @[...] mentions
     def replace_mention_ansi(match):
         mention = match.group(0)
@@ -207,8 +304,9 @@ def highlight_mentions(text: str, state: dict = None) -> tuple:
         return f'[color(13)]{mention}[/color(13)]'  # LIGHT_PURPLE
     
     # Apply mention replacements
-    text_ansi = re.sub(r'@\[[^\]]+\]', replace_mention_ansi, text_ansi)
-    text_rich = re.sub(r'@\[[^\]]+\]', replace_mention_rich, text_rich)
+    # Use negative lookahead to skip @[Graph] patterns (already handled by colorize_graph_mentions)
+    text_ansi = re.sub(r'@\[(?!Graph\])[^\]]+\]', replace_mention_ansi, text_ansi)
+    text_rich = re.sub(r'@\[(?!Graph\])[^\]]+\]', replace_mention_rich, text_rich)
     
     return (text_ansi, text_rich)
 
@@ -272,7 +370,9 @@ class MentionDetailModal(ModalScreen):
                 # Only show Reply button for questions
                 if self.mention.get('is_question', False):
                     yield Button("Reply", variant="success", id="reply-btn")
-                yield Button("Remove from To-Do", variant="error", id="remove-btn")
+                # Different label for questions vs statements
+                remove_label = "Remove from To-Do" if self.mention.get('is_question', False) else "Acknowledge / Dismiss"
+                yield Button(remove_label, variant="error", id="remove-btn")
     
     def on_mount(self) -> None:
         """Display the full message when mounted."""
@@ -816,11 +916,72 @@ class AxionSwarmTUI(App):
         messages_log.write(welcome_msg)
         logger.info(welcome_msg)
         
+        # Start periodic check for web UI commands (every 200ms)
+        self.set_interval(0.2, self.check_web_commands)
+        
         # Start graph execution
         self.graph_task = asyncio.create_task(self.run_graph())
     
+    def check_web_commands(self) -> None:
+        """Periodically check for and display pending web UI commands."""
+        web_commands = get_pending_web_commands()
+        if web_commands:
+            from langchain_core.messages import AIMessage
+            from datetime import datetime
+            
+            messages_log = self.query_one("#messages", RichLog)
+            current_phase = self.state.get("phase_number", 1)
+            
+            for cmd in web_commands:
+                # Check for special system commands
+                if cmd == "@[System][ContinuePhase]":
+                    # User clicked "Continue to Next Phase" in web UI
+                    logger.info(f"[Web UI] User clicked Continue Phase - unblocking phase progression")
+                    messages_log.write(f"[bold blue][Web UI][/bold blue] [green]User clicked Continue to Next Phase[/green]\n")
+                    
+                    # Unblock phase progression
+                    if self.waiting_for_input:
+                        self.waiting_for_input = False
+                        logger.info(f"[STATE] UNBLOCKED - continuing to next phase")
+                        
+                        # Update phase status file
+                        import json
+                        try:
+                            is_final = self.state.get("final_phase_needed") or self.state.get("final_phase_done")
+                            with open('phase_status.json', 'w') as f:
+                                json.dump({
+                                    'waiting': False,
+                                    'phase': current_phase,
+                                    'is_final': is_final
+                                }, f)
+                        except Exception as e:
+                            logger.warning(f"Could not update phase_status.json: {e}")
+                    
+                    continue  # Don't add this to state messages
+                
+                # Regular graph command - add as proper User message to state (so specialists see it)
+                user_timestamp = datetime.now().astimezone().isoformat(timespec='milliseconds')
+                user_msg = AIMessage(
+                    content=cmd,
+                    name="User",
+                    additional_kwargs={"phase": current_phase, "timestamp": user_timestamp}
+                )
+                
+                # Append to state messages
+                existing_messages = self.state.get("messages", [])
+                self.state["messages"] = existing_messages + [user_msg]
+                
+                # Display in TUI
+                messages_log.write(f"[bold blue][Web UI][/bold blue] [green]{cmd}[/green]\n")
+                logger.info(f"[Web UI] {cmd}")
+                
+                # Update displayed message count so we don't re-display this message
+                self.displayed_message_count = len(self.state.get("messages", []))
+    
     def on_unmount(self) -> None:
         """Cleanup when app exits."""
+        # Stop file watcher thread
+        stop_file_watcher.set()
         # Restore original stderr
         sys.stderr = self.original_stderr
         logger.info("=== TUI Exiting ===")
@@ -877,52 +1038,42 @@ class AxionSwarmTUI(App):
                             logger.info(f"[STREAM] Displaying message from: {msg_speaker}")
                             await self.display_message(msg)
                         
+                        # Update phase status when phase number changes
+                        if node_name == "start_phase":
+                            import json
+                            phase = self.state.get("phase_number", 0)
+                            is_final = self.state.get("final_phase_needed") or self.state.get("final_phase_done")
+                            
+                            try:
+                                with open('phase_status.json', 'w') as f:
+                                    json.dump({
+                                        'waiting': False,
+                                        'phase': phase,
+                                        'is_final': is_final
+                                    }, f)
+                                logger.info(f"[STATE] Updated phase status: Phase {phase} started (final={is_final})")
+                            except Exception as e:
+                                logger.warning(f"Could not update phase_status.json: {e}")
+                        
                         # Check if we should pause IMMEDIATELY after execute_phase (before next phase starts)
                         if node_name == "execute_phase":
                             phase = self.state.get("phase_number", 0)
                             is_final = self.state.get("final_phase_needed") or self.state.get("final_phase_done")
                             
-                            # Check for pending "?" questions after EVERY phase (except final)
+                            # Pause after every phase (except final) for user to review and continue via web UI
                             if not is_final:
-                                question_count = sum(1 for m in self.user_mentions if m.get('is_question', False))
-                                
-                                if question_count > 0:
-                                    # Pending questions - must pause BEFORE next phase starts
-                                    logger.info(f"[STATE] Phase {phase} complete with {question_count} pending question(s) - blocking next phase")
-                                    if not self.waiting_for_input:
-                                        await self.pause_for_input()
-                                    # Wait until user continues
-                                    while self.waiting_for_input:
-                                        await asyncio.sleep(0.1)
-                                elif phase >= 3:
-                                    # No pending questions, but phase 3+ - show generic pause
-                                    logger.info(f"[STATE] Phase {phase} complete, no questions - showing generic pause")
+                                logger.info(f"[STATE] Phase {phase} complete - pausing for user to review (continue via web UI)")
+                                if not self.waiting_for_input:
                                     await self.pause_for_input()
-                                    # Wait until user continues
-                                    while self.waiting_for_input:
-                                        await asyncio.sleep(0.1)
-                                # else: Phase 1-2 with no questions - continue immediately
-                                else:
-                                    logger.info(f"[STATE] Phase {phase} complete, no questions - auto-continuing to next phase")
+                                # Wait until user continues (via web UI "Continue" button or TUI input)
+                                while self.waiting_for_input:
+                                    await asyncio.sleep(0.1)
+                                logger.info(f"[STATE] User signaled continue - advancing to next phase")
             
             # Graph ended naturally
-            # Check if there are pending questions that need user attention
-            question_count = sum(1 for m in self.user_mentions if m.get('is_question', False))
             is_final = self.state.get("final_phase_done", False)
             
-            if question_count > 0:
-                # Pending questions exist - pause for user input (regardless of phase)
-                logger.info(f"[STATE] Graph ended but {question_count} question(s) pending - pausing for user input")
-                await self.pause_for_input()
-                # Wait until user continues (answers questions or sends message)
-                while self.waiting_for_input:
-                    await asyncio.sleep(0.1)
-                # After user responds, restart graph to continue
-                self.discussion_ended = False
-                self.state["continue_discussion"] = True
-                logger.info(f"[GRAPH] Restarting graph after user answered questions")
-                self.graph_task = asyncio.create_task(self.run_graph())
-            elif is_final:
+            if is_final:
                 # Final phase complete and no pending questions - show completion message
                 messages_log = self.query_one("#messages", RichLog)
                 completion_msg = "[yellow]Type a message to continue discussion, or /quit to exit[/yellow]"
@@ -977,10 +1128,26 @@ class AxionSwarmTUI(App):
             now = datetime.now().astimezone()
             timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " " + now.strftime("%Z")
         
-        # Format content (collapse whitespace for display, like original)
-        content = msg.content.replace('\n', ' ').replace('\r', ' ')
+        # Format content (collapse whitespace for display, but preserve newlines inside ``` blocks)
         import re
+        
+        # Preserve content inside ``` blocks by temporarily replacing with placeholders
+        backtick_blocks = []
+        def save_backtick_block(match):
+            backtick_blocks.append(match.group(0))
+            return f"___BACKTICK_BLOCK_{len(backtick_blocks)-1}___"
+        
+        # Extract all ``` blocks (including the backticks themselves)
+        content = msg.content
+        content = re.sub(r'```.*?```', save_backtick_block, content, flags=re.DOTALL)
+        
+        # Now collapse whitespace in the non-backtick parts
+        content = content.replace('\n', ' ').replace('\r', ' ')
         content = re.sub(r'\s+', ' ', content).strip()
+        
+        # Restore the ``` blocks with their original formatting
+        for i, block in enumerate(backtick_blocks):
+            content = content.replace(f"___BACKTICK_BLOCK_{i}___", block)
         
         # Apply highlight_mentions to color @mentions
         content_ansi, content_rich = highlight_mentions(content, self.state)
@@ -1051,53 +1218,44 @@ class AxionSwarmTUI(App):
     async def pause_for_input(self) -> None:
         """Show pause message and wait for user."""
         from langchain_core.messages import SystemMessage
+        import json
         
         messages_log = self.query_one("#messages", RichLog)
         current_phase = self.state.get("phase_number", 0)
         
         # Only show notice if we're transitioning from unblocked → blocked
         if not self.waiting_for_input:
-            # Check if there are pending "?" questions
-            question_count = sum(1 for m in self.user_mentions if m.get('is_question', False))
+            # Show Notice about waiting for user to continue via web UI
+            debug_msg = f"⚙️ [dim green]System state: WAITING_FOR_USER | Phase: {current_phase}[/dim green]\n"
+            messages_log.write(debug_msg)
+            logger.info(f"[STATE] WAITING_FOR_USER - Phase {current_phase} complete, waiting for user to continue")
             
-            if question_count > 0:
-                # There are pending questions - show Notice about waiting for them
-                debug_msg = f"⚙️ [dim green]System state: WAITING_FOR_USER | Questions remaining: {question_count} | Phase: {current_phase}[/dim green]\n"
-                messages_log.write(debug_msg)
-                logger.info(f"[STATE] WAITING_FOR_USER - {question_count} questions remain before continuing")
-                
-                notice_msg = SystemMessage(
-                    content=f"Notice: Discussion paused. {question_count} question(s) in User To-Do require attention. Address questions to continue.",
-                    name="Notice",
-                    additional_kwargs={
-                        "timestamp": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
-                        "phase": current_phase
-                    }
-                )
-                self.state["messages"].append(notice_msg)
-                await self.display_message(notice_msg)
-                # Update displayed_message_count since we displayed outside streaming context
-                self.displayed_message_count = len(self.state.get("messages", []))
-            else:
-                # No pending questions - generic pause
-                debug_msg = f"⚙️ [dim green]System state: WAITING_FOR_USER | No pending questions | Phase: {current_phase}[/dim green]\n"
-                messages_log.write(debug_msg)
-                logger.info(f"[STATE] WAITING_FOR_USER - no questions, ready to continue")
-                
-                notice_msg = SystemMessage(
-                    content=f"Notice: Discussion paused. Send a message to continue or dismiss any remaining To-Do items.",
-                    name="Notice",
-                    additional_kwargs={
-                        "timestamp": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
-                        "phase": current_phase
-                    }
-                )
-                self.state["messages"].append(notice_msg)
-                await self.display_message(notice_msg)
-                # Update displayed_message_count since we displayed outside streaming context
-                self.displayed_message_count = len(self.state.get("messages", []))
+            notice_msg = SystemMessage(
+                content=f"Notice: Phase {current_phase} complete. Review decisions in the web UI and click 'Continue to Next Phase' to proceed.",
+                name="Notice",
+                additional_kwargs={
+                    "timestamp": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+                    "phase": current_phase
+                }
+            )
+            self.state["messages"].append(notice_msg)
+            await self.display_message(notice_msg)
+            # Update displayed_message_count since we displayed outside streaming context
+            self.displayed_message_count = len(self.state.get("messages", []))
         
         self.waiting_for_input = True
+        
+        # Update phase status file for web UI
+        try:
+            is_final = self.state.get("final_phase_needed") or self.state.get("final_phase_done")
+            with open('phase_status.json', 'w') as f:
+                json.dump({
+                    'waiting': True,
+                    'phase': current_phase,
+                    'is_final': is_final
+                }, f)
+        except Exception as e:
+            logger.warning(f"Could not update phase_status.json: {e}")
         
         # Focus the input
         input_widget = self.query_one("#input", Input)
@@ -1237,7 +1395,7 @@ class AxionSwarmTUI(App):
                 "  • Messages >2σ from mean are auto-collapsed",
                 "  • @[User] mentions shown in left sidebar (F2)",
                 "  • Click mention to view full context in modal",
-                "  • Modal has 'Remove from To-Do' button",
+                "  • Modal buttons: Reply (questions), Acknowledge/Dismiss (statements)",
                 "  • All messages and errors logged to discussion.log",
                 "",
                 "Or type any message to send to the team"
@@ -1447,6 +1605,10 @@ def main():
     """Entry point for TUI."""
     import sys
     
+    # Start file watcher thread for web UI submissions
+    watcher_thread = threading.Thread(target=watch_user_input_file, daemon=True)
+    watcher_thread.start()
+    
     print("=" * 80)
     print("# 🤖 Axion Swarm - Interactive TUI")
     print("=" * 80)
@@ -1473,6 +1635,14 @@ def main():
         else:
             delete_checkpoint()
             print("🗑️  Starting fresh conversation\n")
+    
+    # Check for any pending web UI commands before starting
+    web_commands = get_pending_web_commands()
+    if web_commands:
+        print(f"[Web UI] Found {len(web_commands)} pending command(s):")
+        for cmd in web_commands:
+            print(f"  {cmd[:100]}...")
+        print()
     
     # Get user goal
     user_goal = input("Enter your discussion topic: ").strip()

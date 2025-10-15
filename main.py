@@ -4,6 +4,10 @@
 import os
 import re
 import sys
+import argparse
+import threading
+import time
+from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from axion_swarm import create_swarm_graph, OverallState
@@ -30,6 +34,74 @@ from axion_swarm.prompts import (
 )
 
 load_dotenv()
+
+# Global queue for web UI commands
+web_ui_commands = []
+web_ui_commands_lock = threading.Lock()
+stop_file_watcher = threading.Event()
+
+
+def watch_user_input_file(filepath='user_input.txt'):
+    """Background thread that tail-follows user_input.txt for web UI submissions.
+    
+    Reads new lines from the file and adds them to the web_ui_commands queue
+    for the main discussion loop to process.
+    """
+    file_path = Path(filepath)
+    last_position = 0
+    
+    print(f"[FileWatcher] Started watching {filepath} for web UI submissions", file=sys.stderr, flush=True)
+    
+    while not stop_file_watcher.is_set():
+        try:
+            if file_path.exists():
+                current_size = file_path.stat().st_size
+                
+                # If file grew, read new content
+                if current_size > last_position:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        f.seek(last_position)
+                        new_lines = f.readlines()
+                        last_position = f.tell()
+                    
+                    # Process new lines
+                    for line in new_lines:
+                        line = line.strip()
+                        # Skip empty lines and comments
+                        if line and not line.startswith('#'):
+                            with web_ui_commands_lock:
+                                web_ui_commands.append(line)
+                            
+                            # Also append to graph.log so it's part of the permanent record
+                            try:
+                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                with open('graph.log', 'a', encoding='utf-8') as f:
+                                    f.write(f"[{timestamp}] User (Web UI) | {line}\n")
+                            except Exception as e:
+                                print(f"[FileWatcher] Warning: Could not append to graph.log: {e}", file=sys.stderr, flush=True)
+                            
+                            print(f"[FileWatcher] Queued command from web UI: {line[:80]}...", file=sys.stderr, flush=True)
+                
+                # If file shrunk (was cleared), reset position
+                elif current_size < last_position:
+                    last_position = 0
+            
+            # Check every 500ms
+            time.sleep(0.5)
+            
+        except Exception as e:
+            print(f"[FileWatcher] Error reading {filepath}: {e}", file=sys.stderr, flush=True)
+            time.sleep(1)
+    
+    print(f"[FileWatcher] Stopped watching {filepath}", file=sys.stderr, flush=True)
+
+
+def get_pending_web_commands():
+    """Get and clear all pending web UI commands."""
+    with web_ui_commands_lock:
+        commands = web_ui_commands.copy()
+        web_ui_commands.clear()
+    return commands
 
 
 def highlight_mentions(text: str, state: dict = None) -> str:
@@ -101,6 +173,10 @@ def highlight_mentions(text: str, state: dict = None) -> str:
     # Replace @[Search][...] patterns
     text = re.sub(r'@\[Search\]\[([^\]]+)\]', replace_search, text, flags=re.IGNORECASE)
     
+    # Then handle @[Graph][...][...][...] patterns with colorization
+    from axion_swarm.colors import colorize_graph_mentions
+    text = colorize_graph_mentions(text)
+    
     # Then handle regular @[...] mentions
     def replace_mention(match):
         import html
@@ -139,8 +215,9 @@ def highlight_mentions(text: str, state: dict = None) -> str:
         # This handles cases like @[A-Za-z0-9.-] from web content
         return mention
     
-    # Find and replace all @[...] patterns (except Search which was already handled)
-    return re.sub(r'@\[[^\]]+\]', replace_mention, text)
+    # Find and replace all @[...] patterns (except Search and Graph which were already handled)
+    # Use negative lookahead to skip @[Graph] patterns entirely (check for Graph followed by ])
+    return re.sub(r'@\[(?!Graph\])([^\]]+)\]', lambda m: replace_mention(f'@[{m.group(1)}]'), text)
 
 
 def display_persona_prompts():
@@ -326,6 +403,11 @@ def run_discussion(initial_state: OverallState):
         # Set very high recursion limit for local LLMs (no practical limit)
         config = {"recursion_limit": 10000}
         for output in graph.stream(initial_state, config):
+            # Check for pending web UI commands and display them
+            web_commands = get_pending_web_commands()
+            if web_commands:
+                for cmd in web_commands:
+                    print(f"{light_blue('[Web UI]')} {light_green(cmd)}\n", flush=True)
             # Track the final state
             for node_output in output.values():
                 if node_output and "messages" in node_output:
@@ -345,6 +427,12 @@ def run_discussion(initial_state: OverallState):
                     is_final_phase = final_state.get("final_phase_needed", False) or final_state.get("final_phase_done", False)
                     
                     if completed_phase >= 3 and not is_final_phase:
+                        # Check for web UI commands before prompting
+                        web_commands = get_pending_web_commands()
+                        if web_commands:
+                            for cmd in web_commands:
+                                print(f"{light_blue('[Web UI]')} {light_green(cmd)}\n", flush=True)
+                        
                         sys.stderr.write("\n⏸️ Press ENTER to continue to next phase (or Ctrl+C to stop): ")
                         sys.stderr.flush()
                         try:
@@ -482,56 +570,87 @@ def run_discussion(initial_state: OverallState):
 
 def main():
     """Main entry point."""
-    # Display all persona prompts at startup
-    display_persona_prompts()
+    # Start file watcher thread for web UI submissions
+    watcher_thread = threading.Thread(target=watch_user_input_file, daemon=True)
+    watcher_thread.start()
     
-    # Display initial room composition
-    display_initial_room_composition()
-    
-    # Now show the welcome header and prompt for input
-    print(f"\n{'='*80}", file=sys.stderr)
-    print("# 🤖 Axion Swarm - Multi-Agent Discussion System", file=sys.stderr)
-    print(f"{'='*80}\n", file=sys.stderr)
-    
-    # Check if checkpoint exists
-    if checkpoint_exists():
-        print("📂 Checkpoint file found!", file=sys.stderr)
-        sys.stderr.write("Resume from checkpoint? (y/n): ")
-        sys.stderr.flush()
-        resume = input().strip().lower()
+    try:
+        # Display all persona prompts at startup
+        display_persona_prompts()
         
-        if resume in ('y', 'yes'):
-            # Load checkpoint and resume (returns None if incompatible)
-            checkpoint_state = load_checkpoint()
-            if checkpoint_state:
-                print(f"✅ Resuming from Phase {checkpoint_state['phase_number']}", file=sys.stderr)
-                print(f"{'='*80}", file=sys.stderr)
-                run_discussion(checkpoint_state)
-                return
+        # Display initial room composition
+        display_initial_room_composition()
+        
+        # Now show the welcome header and prompt for input
+        print(f"\n{'='*80}", file=sys.stderr)
+        print("# 🤖 Axion Swarm - Multi-Agent Discussion System", file=sys.stderr)
+        print(f"{'='*80}\n", file=sys.stderr)
+        
+        # Check if graph.log exists (previous session)
+        graph_log_path = Path('graph.log')
+        if graph_log_path.exists():
+            print("📊 Existing graph.log found from previous session", file=sys.stderr)
+            sys.stderr.write("Clear graph and start fresh? (y/n): ")
+            sys.stderr.flush()
+            clear_graph = input().strip().lower()
+            if clear_graph in ('y', 'yes'):
+                graph_log_path.unlink()
+                print("🗑️  Cleared graph.log - starting fresh\n", file=sys.stderr)
             else:
-                # Checkpoint was incompatible or corrupted - delete it and start fresh
-                print("❌ Checkpoint is incompatible with current code.", file=sys.stderr)
+                print("✅ Keeping existing graph.log - continuing from previous state\n", file=sys.stderr)
+        
+        # Check if checkpoint exists
+        if checkpoint_exists():
+            print("📂 Checkpoint file found!", file=sys.stderr)
+            sys.stderr.write("Resume from checkpoint? (y/n): ")
+            sys.stderr.flush()
+            resume = input().strip().lower()
+            
+            if resume in ('y', 'yes'):
+                # Load checkpoint and resume (returns None if incompatible)
+                checkpoint_state = load_checkpoint()
+                if checkpoint_state:
+                    print(f"✅ Resuming from Phase {checkpoint_state['phase_number']}", file=sys.stderr)
+                    print(f"{'='*80}", file=sys.stderr)
+                    run_discussion(checkpoint_state)
+                    return
+                else:
+                    # Checkpoint was incompatible or corrupted - delete it and start fresh
+                    print("❌ Checkpoint is incompatible with current code.", file=sys.stderr)
+                    delete_checkpoint()
+                    print("   Starting fresh conversation\n", file=sys.stderr)
+            else:
+                # Delete checkpoint and start fresh
                 delete_checkpoint()
-                print("   Starting fresh conversation\n", file=sys.stderr)
-        else:
-            # Delete checkpoint and start fresh
-            delete_checkpoint()
-            print("🗑️  Starting fresh conversation\n", file=sys.stderr)
+                print("🗑️  Starting fresh conversation\n", file=sys.stderr)
+        
+        # Check for any pending web UI commands before starting
+        web_commands = get_pending_web_commands()
+        if web_commands:
+            print(f"\n{light_blue('[Web UI]')} Found {len(web_commands)} pending command(s):", file=sys.stderr)
+            for cmd in web_commands:
+                print(f"  {light_green(cmd)}", file=sys.stderr)
+            print("", file=sys.stderr)
+        
+        # Prompt for discussion topic
+        sys.stderr.write("Enter your discussion topic: ")
+        sys.stderr.flush()
+        user_goal = input().strip()
+        
+        if not user_goal:
+            print("No goal provided. Exiting.", file=sys.stderr)
+            return
+        
+        print()  # Blank line after user input
+        
+        # Create fresh initial state and run
+        initial_state = create_initial_state(user_goal)
+        run_discussion(initial_state)
     
-    # Prompt for discussion topic
-    sys.stderr.write("Enter your discussion topic: ")
-    sys.stderr.flush()
-    user_goal = input().strip()
-    
-    if not user_goal:
-        print("No goal provided. Exiting.", file=sys.stderr)
-        return
-    
-    print()  # Blank line after user input
-    
-    # Create fresh initial state and run
-    initial_state = create_initial_state(user_goal)
-    run_discussion(initial_state)
+    finally:
+        # Stop file watcher on exit
+        stop_file_watcher.set()
+        watcher_thread.join(timeout=2)
 
 
 if __name__ == "__main__":
