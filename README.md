@@ -53,11 +53,22 @@ Axion Swarm orchestrates conversations between specialized AI agents to provide 
 
 ---
 
-### November 2, 2025 (Late Session) - Critical Bug Fixes: Chair Deduplication + Web UI Reactivity
+### November 2, 2025 (Late Session) - Critical Fixes + Dedupe Schema Redesign
 
-**Chair Deduplication Catastrophic Failure Fix:**
-- **Bug**: Chair's LLM hallucinated and marked ALL 25 answers as "duplicates of their parent questions" - nonsensical structural error that removed all user-visible answer options
-- **Root Cause**: Chair dedupe prompt lacked validation rules to prevent structural impossibilities (answer ≠ duplicate of its question)
+**New Dedupe Schema - Eliminates Hallucinations:**
+- **Problem**: Chair's LLM repeatedly hallucinated "path is duplicate of itself" despite validation rules - old schema was positionally ambiguous
+- **Old format** (ambiguous): `@[Graph][Update][duplicate][🧹][canonical]` ← Which position is which?
+- **New format** (explicit): 
+  ```
+  @[Graph][KeepCanonical][path_to_keep]       ← Clear: this stays
+  @[Graph][MarkDuplicate][path_to_remove]     ← Clear: this goes
+  ```
+- **Result**: Chair now correctly identifies semantic duplicates without self-reference hallucinations
+- **Impact**: Two-command format removes positional ambiguity, tested successfully in production
+
+**Chair Deduplication Hallucination Fixes:**
+- **Bug**: Chair's LLM hallucinated 3 times today marking paths as duplicates of themselves or parent questions
+- **Root Cause**: Ambiguous single-command format `[duplicate][🧹][canonical]` was cognitively confusing
 - **Backend Validation** (`graph_tool.py` lines 488-538):
   - Added 3-level validation for duplicate markers before processing
   - Rejects: Answer marked as duplicate of parent question
@@ -87,9 +98,19 @@ Axion Swarm orchestrates conversations between specialized AI agents to provide 
 - **Fix** (`QuestionNode.vue` line 406): Build full answer path by prepending parent question path: `const fullAnswerPath = props.path + answerPath`
 - **Result**: PENDING badge now correctly clears from parents when nested questions are answered
 
-**Files Modified:** `axion_swarm/graph_tool.py`, `axion_swarm/prompts.py`, `web/src/App.vue`, `web/src/components/QuestionNode.vue`
+**New Dedupe Implementation:**
+- `prompts.py`: Chair dedupe prompt with KeepCanonical/MarkDuplicate format, updated validation rules, updated specialist guidance
+- `graph_tool.py`: Processes new operations, validates no path marked as both canonical AND duplicate
+- `graph_parser.py`: Recognizes KeepCanonical/MarkDuplicate operations, marks duplicates in vote_tally
 
-**Testing Status**: All fixes tested and validated in production ✅
+**Other Fixes:**
+- `web/src/App.vue`: Viewport pinning fix, modal click-through prevention, removed inaccurate modal text
+- `web/src/components/QuestionNode.vue`: PENDING badge reactivity fix, answer viewport pinning fix, duplicate specialist name deduplication
+- `webserver.py`: Atomic phase broadcasting (buffers updates during phase execution)
+
+**Data Cleanup**: Removed 72+ invalid self-duplicate markers from production graph.log
+
+**Testing Status**: New schema tested and verified working - Chair correctly identified 2 semantic duplicates without hallucinations ✅
 
 ---
 

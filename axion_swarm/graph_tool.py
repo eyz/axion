@@ -189,6 +189,8 @@ def detect_graph_requests(message_content: str) -> List[dict]:
     Supports operations:
         @[Graph][Create] - Propose new Q->A paths
         @[Graph][Update] - Vote on or extend existing paths
+        @[Graph][KeepCanonical] - Mark path as canonical (Chair dedupe only)
+        @[Graph][MarkDuplicate] - Mark path as duplicate (Chair dedupe only)
         @[Graph][Because] - Citation (existing path)
         @[Graph][If] - Citation (potential path)
         @[Graph][Regarding] - User comment on path
@@ -303,7 +305,7 @@ def validate_graph_update(content: str) -> tuple[bool, str, dict]:
 
 
 def log_graph_operations(graph_requests: List[dict], requester_name: str, phase: int = None) -> List[AIMessage]:
-    """Log @[Graph][Create] and @[Graph][Update] operations to graph.log.
+    """Log @[Graph][Create], @[Graph][Update], @[Graph][KeepCanonical], and @[Graph][MarkDuplicate] operations to graph.log.
     Validates each operation and returns Notice messages for malformed entries.
         
     Args:
@@ -319,9 +321,9 @@ def log_graph_operations(graph_requests: List[dict], requester_name: str, phase:
     if not _created_paths:
         load_existing_paths_from_log()
     
-    # Filter for Create and Update operations only
+    # Filter for Create, Update, and new dedupe operations
     operations = [req for req in graph_requests 
-                  if req.get('operation') in ['Create', 'Update']]
+                  if req.get('operation') in ['Create', 'Update', 'KeepCanonical', 'MarkDuplicate']]
     
     if not operations:
         return []
@@ -332,6 +334,8 @@ def log_graph_operations(graph_requests: List[dict], requester_name: str, phase:
     
     notice_messages = []
     auto_clear_operations = []  # Collect operations to auto-clear user selections from duplicates
+    canonical_paths = set()  # Collect paths marked as canonical
+    duplicate_paths = set()  # Collect paths marked as duplicates
     
     try:
         with open(log_path, 'a', encoding='utf-8') as f:
@@ -482,60 +486,22 @@ def log_graph_operations(graph_requests: List[dict], requester_name: str, phase:
                     # Skip writing this malformed entry to graph.log
                     continue
                 
-                # Valid - write to graph.log
-                f.write(f"[{timestamp}] {phase_str} | {requester_name} | {cleaned_raw}\n")
+                # PROCESS NEW DEDUPE OPERATIONS (KeepCanonical / MarkDuplicate)
+                if operation_type in ['KeepCanonical', 'MarkDuplicate'] and requester_name == 'Chair':
+                    # Extract the path from the operation
+                    path_content = cleaned_raw.replace(f'@[Graph][{operation_type}]', '')
+                    marked_path = extract_path_from_content(path_content)
+                    
+                    if operation_type == 'KeepCanonical':
+                        canonical_paths.add(marked_path)
+                    elif operation_type == 'MarkDuplicate':
+                        duplicate_paths.add(marked_path)
+                        # Queue for auto-clear if user has selections on this duplicate
+                        if marked_path:
+                            auto_clear_operations.append(marked_path)
                 
-                # If this is a duplicate marker ([🧹]) from Chair, validate and queue auto-clear operation
-                if operation_type == 'Update' and '[🧹]' in cleaned_raw and requester_name == 'Chair':
-                    # Extract the duplicate path (the one being marked as duplicate)
-                    # Format: @[Graph][Update][duplicate_path][🧹][canonical_path]
-                    broom_index = cleaned_raw.find('[🧹]')
-                    if broom_index > 0:
-                        before_broom = cleaned_raw[:broom_index]
-                        after_broom = cleaned_raw[broom_index + len('[🧹]'):]
-                        
-                        duplicate_path = extract_path_from_content(before_broom)
-                        canonical_path = extract_path_from_content(after_broom)
-                        
-                        # VALIDATION: Reject nonsensical duplicate markers
-                        is_valid_duplicate = True
-                        rejection_reason = None
-                        
-                        if duplicate_path and canonical_path:
-                            # Check 1: Duplicate and canonical must be DIFFERENT paths
-                            if duplicate_path == canonical_path:
-                                is_valid_duplicate = False
-                                rejection_reason = "Duplicate and canonical paths are identical"
-                            
-                            # Check 2: Answer cannot be duplicate of its parent question
-                            # If duplicate has [A] but canonical doesn't, and canonical is a prefix of duplicate,
-                            # then duplicate is an answer under canonical question - INVALID
-                            elif '[A]' in duplicate_path and '[A]' not in canonical_path:
-                                if duplicate_path.startswith(canonical_path):
-                                    is_valid_duplicate = False
-                                    rejection_reason = "Answer cannot be marked as duplicate of its parent question"
-                            
-                            # Check 3: Question cannot be duplicate of answer under that question
-                            # If canonical has [A] but duplicate doesn't, and canonical starts with duplicate,
-                            # then canonical is an answer under duplicate question - INVALID
-                            elif '[A]' in canonical_path and '[A]' not in duplicate_path:
-                                if canonical_path.startswith(duplicate_path):
-                                    is_valid_duplicate = False
-                                    rejection_reason = "Question cannot be marked as duplicate of its own answer"
-                        
-                        if is_valid_duplicate and duplicate_path:
-                            auto_clear_operations.append(duplicate_path)
-                        elif not is_valid_duplicate:
-                            # Log rejection to stderr and graph.log as a validation notice
-                            print(f"\n{'='*80}", file=sys.stderr)
-                            print(f"⚠️  REJECTED INVALID DUPLICATE MARKER from Chair", file=sys.stderr)
-                            print(f"{'='*80}", file=sys.stderr)
-                            print(f"Reason: {rejection_reason}", file=sys.stderr)
-                            print(f"Chair attempted: {cleaned_raw[:150]}{'...' if len(cleaned_raw) > 150 else ''}", file=sys.stderr)
-                            print(f"{'='*80}\n", file=sys.stderr)
-                            
-                            # Write rejection notice to graph.log
-                            f.write(f"[{timestamp}] {phase_str} | REJECTED | {cleaned_raw} | Reason: {rejection_reason}\n")
+                # Write valid entry to graph.log
+                f.write(f"[{timestamp}] {phase_str} | {requester_name} | {cleaned_raw}\n")
                 
                 # Track newly created paths for future Create/Update validation
                 if operation_type == 'Create' and path:
@@ -544,6 +510,16 @@ def log_graph_operations(graph_requests: List[dict], requester_name: str, phase:
     except Exception as e:
         # Don't fail if logging doesn't work - just continue
         print(f"Warning: Could not log to graph.log: {e}", file=sys.stderr)
+    
+    # VALIDATE: Ensure no path is marked as both canonical AND duplicate
+    conflicting_paths = canonical_paths.intersection(duplicate_paths)
+    if conflicting_paths:
+        print(f"\n{'='*80}", file=sys.stderr)
+        print(f"⚠️  VALIDATION ERROR: Paths marked as BOTH canonical AND duplicate", file=sys.stderr)
+        print(f"{'='*80}", file=sys.stderr)
+        for path in list(conflicting_paths)[:5]:  # Show first 5
+            print(f"  Conflict: {path[:100]}", file=sys.stderr)
+        print(f"{'='*80}\n", file=sys.stderr)
     
     # Process auto-clear operations for duplicates with user selections
     if auto_clear_operations:

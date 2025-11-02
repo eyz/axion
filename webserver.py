@@ -170,6 +170,7 @@ async def broadcast_graph_update():
 async def broadcast_phase_status():
     """Broadcast phase status to all connected clients."""
     import json
+    global phase_broadcast_buffer
     
     try:
         phase_status_path = Path('phase_status.json')
@@ -179,8 +180,20 @@ async def broadcast_phase_status():
         with phase_status_path.open('r') as f:
             status = json.load(f)
         
-        print(f"[WebServer] Broadcasting phase status: Phase {status.get('phase', 0)}, waiting={status.get('waiting', False)}")
+        waiting = status.get('waiting', False)
+        phase_num = status.get('phase', 0)
+        
+        # Update buffer state
+        was_running = phase_broadcast_buffer['phase_running']
+        phase_broadcast_buffer['phase_running'] = not waiting
+        
+        print(f"[WebServer] Broadcasting phase status: Phase {phase_num}, waiting={waiting}")
         await sio.emit('phase_status', status)
+        
+        # If phase just completed (was running, now waiting), broadcast buffered updates
+        if was_running and waiting:
+            print(f"[WebServer] 🔄 Phase {phase_num} completed (waiting={waiting}) - checking for buffered updates...")
+            await check_and_broadcast_if_ready()
         
     except Exception as e:
         print(f"[WebServer] Error broadcasting phase status: {e}")
@@ -354,6 +367,24 @@ async def continue_phase(sid, data):
         await sio.emit('continue_error', {'error': str(e)}, to=sid)
 
 
+# Atomic phase broadcasting state
+phase_broadcast_buffer = {
+    'has_pending': False,
+    'phase_running': False
+}
+
+
+async def check_and_broadcast_if_ready():
+    """Check if phase is complete and broadcast buffered updates if ready."""
+    global phase_broadcast_buffer
+    
+    # If phase is complete (waiting: true) AND we have pending updates, broadcast now
+    if not phase_broadcast_buffer['phase_running'] and phase_broadcast_buffer['has_pending']:
+        print(f"[WebServer] 🎯 Phase complete - broadcasting buffered graph updates atomically")
+        phase_broadcast_buffer['has_pending'] = False
+        await broadcast_graph_update()
+
+
 # File watcher for graph.log and phase_status.json
 class GraphLogHandler(FileSystemEventHandler):
     """Watch graph.log and phase_status.json for changes and broadcast updates."""
@@ -363,9 +394,28 @@ class GraphLogHandler(FileSystemEventHandler):
     
     def on_modified(self, event):
         if event.src_path.endswith('graph.log'):
-            print(f"[WebServer] graph.log updated (inotify), broadcasting changes...")
-            # Schedule broadcast in the event loop
-            asyncio.run_coroutine_threadsafe(broadcast_graph_update(), self.loop)
+            # Detect if this is a user action (contains "User (Web UI)")
+            try:
+                with open('graph.log', 'r') as f:
+                    lines = f.readlines()
+                    last_line = lines[-1] if lines else ''
+                    is_user_action = 'User (Web UI)' in last_line
+            except:
+                is_user_action = False
+            
+            if is_user_action:
+                # User actions bypass buffering - broadcast immediately
+                print(f"[WebServer] graph.log updated (user action), broadcasting immediately...")
+                asyncio.run_coroutine_threadsafe(broadcast_graph_update(), self.loop)
+            elif phase_broadcast_buffer['phase_running']:
+                # Phase is running - buffer the update instead of broadcasting
+                print(f"[WebServer] graph.log updated (phase running), buffering update...")
+                phase_broadcast_buffer['has_pending'] = True
+            else:
+                # Phase not running - broadcast immediately
+                print(f"[WebServer] graph.log updated (phase idle), broadcasting changes...")
+                asyncio.run_coroutine_threadsafe(broadcast_graph_update(), self.loop)
+                
         elif event.src_path.endswith('phase_status.json'):
             print(f"[WebServer] phase_status.json updated (inotify), broadcasting phase status...")
             asyncio.run_coroutine_threadsafe(broadcast_phase_status(), self.loop)
@@ -373,7 +423,6 @@ class GraphLogHandler(FileSystemEventHandler):
     def on_created(self, event):
         if event.src_path.endswith('graph.log'):
             print(f"[WebServer] graph.log created (inotify), broadcasting changes...")
-            # Schedule broadcast in the event loop
             asyncio.run_coroutine_threadsafe(broadcast_graph_update(), self.loop)
         elif event.src_path.endswith('phase_status.json'):
             print(f"[WebServer] phase_status.json created (inotify), broadcasting phase status...")

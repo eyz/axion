@@ -17,9 +17,6 @@
         <p class="modal-message">
           Specialists have added <strong>{{ newContentCount }}</strong> new {{ newContentCount === 1 ? 'item' : 'items' }} to the decision tree.
         </p>
-        <p class="modal-submessage">
-          The tree will update when you acknowledge.
-        </p>
         <button @click="acknowledgeNewContent" class="acknowledge-button">
           Acknowledge & Continue
         </button>
@@ -657,19 +654,30 @@ export default {
     // - If no selection → count it
     // - If HAS selection → recurse into selected answer's nested questions
     const unansweredQuestionCount = computed(() => {
-      const countUnansweredInSubtree = (questionPath) => {
-        // Skip if question is dismissed
-        if (isNodeXed(questionPath)) return 0
-        
-        // Check SUBMITTED selection, not current selection
-        const selection = selectionsAtLastSubmit[questionPath]
-        
-        // No SUBMITTED selection on this question → count it
-        if (!selection) {
-          console.log(`⚠️  Question counted as unanswered: "${questionPath}"`)
-          console.log(`   selectionsAtLastSubmit has NO entry for this question`)
-          return 1
-        }
+  const countUnansweredInSubtree = (questionPath) => {
+    // Skip if question is dismissed
+    if (isNodeXed(questionPath)) return 0
+    
+    // Check if user has added thoughts to this question (counts as engagement)
+    const node = graphData.nodes[questionPath]
+    if (node && node.user_thoughts && node.user_thoughts.length > 0) {
+      // User engaged with a thought, not pending - BUT still check nested questions
+      // Continue with nested question counting below
+    } else {
+      // Check SUBMITTED selection, not current selection
+      const selection = selectionsAtLastSubmit[questionPath]
+      
+      // No SUBMITTED selection AND no thoughts on this question → count it
+      if (!selection) {
+        console.log(`⚠️  Question counted as unanswered: "${questionPath}"`)
+        console.log(`   selectionsAtLastSubmit has NO entry for this question`)
+        return 1
+      }
+    }
+    
+    // If we get here, either has thoughts OR has selection - check nested questions
+    const selection = selectionsAtLastSubmit[questionPath]
+    if (!selection) return 0 // Has thoughts but no selection - don't recurse
         
         // Has SUBMITTED selection → check for nested questions under selected answers
         let nestedCount = 0

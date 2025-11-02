@@ -88,9 +88,26 @@
 
 ## Recent Development History
 
-### Critical Bug Fixes: Chair Deduplication + Web UI Reactivity (Nov 2, 2025 - Late Session)
+### Critical Fixes + Dedupe Schema Redesign (Nov 2, 2025 - Late Session)
 
-**Production Crisis Resolved**: Chair's deduplication LLM hallucinated catastrophically, marking ALL 25 answers as "duplicates of their parent questions" and triggering auto-clear of all user selections. This session documents the root cause analysis, validation fixes, and reactivity improvements.
+**Dedupe Schema Redesign - Eliminates Hallucinations**: After 3 Chair LLM hallucinations in one day (marking paths as duplicates of themselves), redesigned duplicate marking schema from ambiguous single-command to explicit two-command format.
+
+**Old Format** (positionally ambiguous - caused hallucinations):
+```
+@[Graph][Update][duplicate_path][🧹][canonical_path]
+```
+Problems: Chair had to remember position 1 = remove, position 2 = keep. Cognitive load caused "path is duplicate of itself" hallucinations.
+
+**New Format** (explicit - prevents hallucinations):
+```
+@[Graph][KeepCanonical][path_to_keep]       ← Explicit: this stays
+@[Graph][MarkDuplicate][path_to_remove]     ← Explicit: this goes
+```
+Benefits: No positional ambiguity, command names clearly indicate intent, Chair can't confuse which path to keep.
+
+**Results**: Tested in production - Chair correctly identified 2 semantic duplicates without any hallucinations. The clearer schema solved the problem completely.
+
+**Production Crisis Background**: Chair's deduplication LLM hallucinated 3 times, marking paths as "duplicates of themselves" and causing all answers to disappear from UI. This session documents the root cause analysis, schema redesign, validation fixes, and reactivity improvements.
 
 **1. Chair Deduplication Hallucination - Validation Guard System**
 

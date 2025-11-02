@@ -155,6 +155,7 @@ def analyze_graph_log(log_path):
     nodes = {}
     vote_tally = defaultdict(lambda: {'upvotes': 0, 'downvotes': 0, 'duplicates': 0, 'up_by': [], 'down_by': [], 'duplicate_by': [], 'canonical_path': None})
     specialist_stats = defaultdict(lambda: {'upvotes': 0, 'downvotes': 0, 'duplicates': 0, 'total': 0, 'by_phase': defaultdict(int)})
+    canonical_paths = []  # Track KeepCanonical paths to link with MarkDuplicate
     
     for line in lines:
         line = line.strip()
@@ -170,11 +171,14 @@ def analyze_graph_log(log_path):
             handle_regarding_entry(content, timestamp, specialist, nodes)
             continue
         
-        # Try to match with phase number (specialist Create or Update)
-        match = re.match(r'\[([^\]]+)\] Phase (\d+) \| ([^|]+) \| @\[Graph\]\[(?:Create|Update)\](.+)$', line)
+        # Try to match with phase number (specialist operations)
+        match = re.match(r'\[([^\]]+)\] Phase (\d+) \| ([^|]+) \| @\[Graph\]\[(?:Create|Update|KeepCanonical|MarkDuplicate)\](.+)$', line)
         if match:
             timestamp, phase, specialist, content = match.groups()
             specialist = specialist.strip()
+            # Extract operation type
+            operation_match = re.search(r'@\[Graph\]\[(\w+)\]', line)
+            operation_type = operation_match.group(1) if operation_match else 'Update'
         else:
             # Try to match without phase number (user votes from Web UI - always Update)
             match = re.match(r'\[([^\]]+)\] ([^|]+) \| @\[Graph\]\[Update\](.+)$', line)
@@ -183,6 +187,7 @@ def analyze_graph_log(log_path):
             timestamp, specialist, content = match.groups()
             specialist = specialist.strip()
             phase = 'User'  # Mark as user-submitted
+            operation_type = 'Update'
         
         # Parse brackets character by character
         bracket_contents = []
@@ -270,10 +275,34 @@ def analyze_graph_log(log_path):
         if not full_path:
             continue
         
+        # HANDLE NEW DEDUPE OPERATIONS (KeepCanonical / MarkDuplicate)
+        if operation_type == 'KeepCanonical':
+            # Record this path as canonical for tooltip lookup
+            canonical_paths.append(full_path)
+            continue
+        elif operation_type == 'MarkDuplicate':
+            # Mark this path as a duplicate
+            vote_tally[full_path]['duplicates'] += 1
+            vote_tally[full_path]['duplicate_by'].append(specialist)
+            specialist_stats[specialist]['duplicates'] += 1
+            
+            # Find matching canonical path (same parent question)
+            # Extract question part from duplicate path
+            question_match = re.match(r'(\[Q:[^\]]+\]\[[^\]]+\])', full_path)
+            if question_match:
+                question_part = question_match.group(1)
+                # Find KeepCanonical path with same question
+                for canonical in canonical_paths:
+                    if canonical.startswith(question_part):
+                        vote_tally[full_path]['canonical_path'] = canonical
+                        break
+            
+            continue
+        
         # Detect vote and comment (support both old ASCII and new emoji format)
         vote = None
         vote_comment = None
-        canonical_path = None  # For duplicate markers
+        canonical_path = None  # For old duplicate markers (legacy support)
         vote_map = {
             '+': '👍',      # Specialist upvote
             '-': '👎',      # Specialist downvote

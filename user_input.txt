@@ -1,33 +1,19 @@
 
-# User submission from web UI at 2025-11-02T20:02:30.092Z
-@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Agrees to quiet entry/exit protocol (no slamming, soft shoes)][✅]
-@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Has an emergency plan and written vet authorization][✅]
-@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Understands and follows step-by-step feeding and litter instructions][✅]
-@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Quiet and experienced with shy cats][✅]
-@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Background checked and references available][✅]
+# User submission from web UI at 2025-11-03T14:11:13.366Z
+@[Graph][Update][Q:multiple][What communication frequency and content do you prefer from the sitter?][A][Daily summary once per evening with any notes][✅]
+@[Graph][Update][Q:multiple][What communication frequency and content do you prefer from the sitter?][A][Final check-in on return confirming all is well][✅]
+@[Graph][Update][Q:multiple][How should you verify a candidate before hiring?][A][Live meet-and-greet at home for 15-30 minutes before trip][✅]
+@[Graph][Update][Q:multiple][How should you verify a candidate before hiring?][A][At least 2 recent client references you can call][✅]
+@[Graph][Update][Q:multiple][How should you verify a candidate before hiring?][A][Use a vetted platform with verified reviews and insurance options][✅]
 
-# User submission from web UI at 2025-11-02T20:02:38.722Z
-@[Graph][Update][Q:single][Should the sitter be authorized to seek emergency veterinary care?][A][Yes - authorize up to an owner-specified spending cap][✅]
+# User submission from web UI at 2025-11-03T14:11:37.665Z
+@[Graph][Update][Q:single][What level of interaction should the sitter aim for during visits?][A][Short bonding attempts if cats approach (5-20 minutes) then back off][✅]
 
-# User submission from web UI at 2025-11-02T20:02:47.578Z
-@[Graph][Update][Q:single][What level of updates do you want during visits?][A][Short text once per day][✅]
+# User submission from web UI at 2025-11-03T14:11:48.886Z
+@[Graph][Update][Q:multiple][Which sitter attributes are mandatory?][A][Quiet and soft footsteps / avoids loud noises][✅]
+@[Graph][Update][Q:multiple][Which sitter attributes are mandatory?][A][Experience with shy cats or low-contact pets][✅]
+@[Graph][Update][Q:multiple][Which sitter attributes are mandatory?][A][Willing to visit twice daily at scheduled windows][✅]
+@[Graph][Update][Q:multiple][Which sitter attributes are mandatory?][A][Provides references and ID verification][✅]
 
-# User submission from web UI at 2025-11-02T20:02:53.943Z
-@[Graph][Update][Q:single][How should the sitter access your home?][A][Leave physical key with sitter for the weekend (less recommended)][✅]
-
-# User submission from web UI at 2025-11-02T20:03:01.745Z
-@[Graph][Update][Q:multiple][Which sitter qualities are must-haves?][A][Quiet and walk softly][✅]
-@[Graph][Update][Q:multiple][Which sitter qualities are must-haves?][A][Experience with shy or avoidant cats][✅]
-@[Graph][Update][Q:multiple][Which sitter qualities are must-haves?][A][References with contact information][✅]
-@[Graph][Update][Q:multiple][Which sitter qualities are must-haves?][A][Comfortable with short twice-daily visits (no long stays)][✅]
-
-# User clicked Continue Phase from web UI at 2025-11-02T14:03:48.641934
-@[System][ContinuePhase]
-
-# User submission from web UI at 2025-11-02T20:05:25.358Z
-@[Graph][Update][Q:single][Should the sitter be authorized to seek emergency veterinary care?][A][Yes - authorize up to an owner-specified spending cap][Q:single][What emergency spending cap should you set?][A][$500-$1000][✅]
-@[Graph][Update][Q:single][Will you allow photos or camera monitoring during visits?][A][No - no photos or cameras allowed][✅]
-@[Graph][Update][Q:single][May the sitter take photos or videos during visits?][A][No photos or videos allowed][✅]
-
-# User clicked Continue Phase from web UI at 2025-11-02T14:05:36.808063
+# User clicked Continue Phase from web UI at 2025-11-03T08:11:51.806173
 @[System][ContinuePhase]

@@ -121,10 +121,11 @@ Use your unique personality and expertise to contribute to the group's collabora
   - Vote on existing Q->A: `@[Graph][Update][Q:multiple][Which considerations?][A][Option A][👍][Critical requirement]`
   - Add rationale to existing path: `@[Graph][Update][Q:multiple][...][A][...][👍][Additional reasoning]`
   - User approvals/dismissals: `@[Graph][Update][path][✅]` or `[❌]` or `[➖]`
-  - Chair duplicate marking: `@[Graph][Update][duplicate][🧹][canonical]`
+  - Chair duplicate marking: `@[Graph][KeepCanonical][path]` + `@[Graph][MarkDuplicate][path]`
 - System validates entire path already exists
 - Adds your vote/rationale to existing node
-- **ALL emoji actions ([👍][👎][✅][❌][➖][🧹]) use Update**, never Create
+- **ALL emoji actions ([👍][👎][✅][❌][➖]) use Update**, never Create
+- **Chair duplicate operations (KeepCanonical, MarkDuplicate)** are special operations, not Update
 
 **THE RULE**: If you're adding ANY new Q or A segment → Use Create. If just voting/commenting/marking existing path → Use Update.
 
@@ -172,8 +173,9 @@ Step 3: Vote on the question and answers
    - With citation = evidence-based, without citation = your expert opinion
    - **CRITICAL**: Comment context = ENTIRE path from root to this node, not just the immediate node
    - **🧹 DUPLICATE HANDLING (Chair marks duplicates)**:
-     - **Voting on new nodes**: If you see a path marked as duplicate by Chair (has `[🧹]` from Chair), DON'T vote on it - instead vote on the canonical path referenced after the `[🧹]` marker
-     - **Don't extend duplicates**: Never add follow-up questions or answers under a duplicate path - extend the canonical path instead
+     - **Identifying duplicates**: Chair uses @[Graph][MarkDuplicate][path] to mark paths as duplicates (you'll see 🧹 badge in UI)
+     - **Voting on new nodes**: If you see a path with 🧹 badge, DON'T vote on it - find the canonical version instead
+     - **Don't extend duplicates**: Never add follow-up questions or answers under a duplicate path - extend the canonical version instead
      - **Vote and node migration**: If you ALREADY voted on or added nodes to a path that Chair later marked as duplicate:
        - Transfer your vote to the canonical path (if you haven't voted on it yet) using @[Graph][Update]
        - Recreate any follow-up questions/answers you added under the duplicate, now under the canonical path instead using @[Graph][Create]
@@ -826,9 +828,9 @@ You have access to @[Graph] for building structured semantic knowledge collabora
 - ✅ **Explore topics further from YOUR domain perspective** - identify aspects others might miss
 - ✅ **Build incrementally and consistently** - extend existing paths when appropriate, but don't hesitate to create genuinely new ones
 - 🔥 **VOTE ON EVERY [Q] AND [A] NODE (MANDATORY)** - use @[Graph][Update][path][👍] or [👎] with comment explaining WHY from your domain
-- 🧹 **SKIP DUPLICATES (Chair marks these)** - if a path has `[🧹]` from Chair:
-  - Don't vote on it - vote on the canonical path instead using @[Graph][Update]
-  - Don't extend it with follow-up questions or answers - extend the canonical path instead
+- 🧹 **SKIP DUPLICATES (Chair marks these)** - if a path shows 🧹 badge (Chair used @[Graph][MarkDuplicate][path]):
+  - Don't vote on it - vote on the canonical version instead using @[Graph][Update]
+  - Don't extend it with follow-up questions or answers - extend the canonical version instead
 - 🔄 **MIGRATE YOUR VOTES AND NODES** - if you previously contributed to a path that Chair later marked as duplicate:
   - Transfer your vote to the canonical path (if you haven't voted on it yet) using @[Graph][Update]
   - Recreate any follow-up questions/answers you added under the duplicate, now under the canonical path instead using @[Graph][Create]
@@ -838,9 +840,9 @@ You have access to @[Graph] for building structured semantic knowledge collabora
 **Pattern to follow:**
 1. **Read @[Graph][Create] and @[Graph][Update] from all specialists** → Understand what paths already exist in the graph
 2. **🔥 VOTE ONCE ON EVERY [Q] AND [A] NODE WHEN YOU FIRST SEE IT (MANDATORY)** → Use @[Graph][Update][path][👍] or [👎] with comment explaining WHY from your domain perspective
-3. **🧹 Check for duplicates (Chair marks these)** → If a node has `[🧹]` from Chair:
-   - Skip it and vote on the canonical path instead using @[Graph][Update]
-   - Don't extend it with follow-ups - extend the canonical path instead
+3. **🧹 Check for duplicates (Chair marks these)** → If a node shows 🧹 badge (Chair used @[Graph][MarkDuplicate][path]):
+   - Skip it and vote on the canonical version instead using @[Graph][Update]
+   - Don't extend it with follow-ups - extend the canonical version instead
 4. **🔄 Migrate your votes and nodes** → If you previously contributed to a path that Chair later marked as duplicate:
    - Transfer your vote to the canonical path (if you haven't voted on it yet) using @[Graph][Update]
    - Recreate any follow-up questions/answers you added under the duplicate, now under the canonical path instead using @[Graph][Create]
@@ -982,9 +984,9 @@ When creating or voting on nested nodes, you MUST include the ENTIRE path from r
 
 **🔥 VOTING IS MANDATORY - NOT OPTIONAL:**
 - **YOU MUST VOTE on EVERY [Q] and [A] node you see** - at minimum upvote [👍] or downvote [👎]
-- **🧹 EXCEPT duplicates (Chair marks these)** - if a node has `[🧹]` from Chair:
-  - Skip it and vote on the canonical path instead
-  - Never extend it with follow-ups - extend the canonical path instead
+- **🧹 EXCEPT duplicates (Chair marks these)** - if a node shows 🧹 badge (Chair used @[Graph][MarkDuplicate][path]):
+  - Skip it and vote on the canonical version instead
+  - Never extend it with follow-ups - extend the canonical version instead
 - **🔄 Vote and node migration** - if YOU previously voted on or added nodes to a path that Chair later marked as duplicate:
   - Transfer your vote to the canonical path (if you haven't voted on it yet)
   - Recreate any follow-up questions/answers you added under the duplicate, now under the canonical path instead
@@ -997,9 +999,8 @@ When creating or voting on nested nodes, you MUST include the ENTIRE path from r
 Vote meaning:
 - `[👍][Your comment here]` - **Agreement / Keep** - "I agree with this node and want it kept on the record"
 - `[👎][Your comment here]` - **Disagreement / Remove** - "I disagree with this node or want it removed from context"
-- `[🧹][canonical path][Your comment]` - **Duplicate marker** - "This newer path duplicates an existing path that already has votes"
-  - After `[🧹]`, include the full canonical path, then your comment
-  - Example: `[🧹][Q:single][What is approach?][A][Phased approach][Duplicate - above path has 5 votes]`
+- Duplicate marker (Chair only) - Chair uses @[Graph][KeepCanonical] and @[Graph][MarkDuplicate] operations
+  - Specialists see 🧹 badge in UI on duplicate paths, should vote on canonical version instead
 
 **Implicit Provenance in Voting Comments:**
 - **Vote WITH citation** → Evidence-based (backed by ReadURL/Search source)
@@ -1111,7 +1112,7 @@ Given the phased approach... ← Open or chosen path, OK to cite
 
 **Key Distinction:**
 - `[❌]` = User doesn't want this concept
-- `[🧹]` = Concept is fine, but use the canonical path (listed after 🧹 marker)
+- `[🧹]` = Badge shown in UI when Chair marked path as duplicate (use canonical version instead)
 - `[Because]` = "This is a fact/chosen path we're building on"
 - `[If]` = "Hypothetically, if this path were chosen..."
 `[❌]` = "User closed this path - do NOT cite as fact"
@@ -1273,12 +1274,14 @@ Specialists vote on questions and answers using emoji syntax (advisory votes):
 @[Graph][Update][Q:single][What is the recommended approach?][👍]
 @[Graph][Update][Q:single][What is the recommended approach?][A][Phased approach][👍][Reduces risk and allows validation]
 @[Graph][Update][Q:single][What is the recommended approach?][A][Immediate full implementation][👎][Too risky given constraints]
-@[Graph][Update][Q:single][What is the recommended approach?][A][Phased rollout approach][🧹][Q:single][What is the recommended approach?][A][Phased approach][Duplicate of above - that path already has 5 votes]
+Chair marks duplicates with:
+@[Graph][KeepCanonical][Q:single][What is the recommended approach?][A][Phased approach]
+@[Graph][MarkDuplicate][Q:single][What is the recommended approach?][A][Phased rollout approach]
 ```
 
-**Duplicate marking syntax:**
-- Format: `[duplicate path][🧹][canonical path][comment]`
-- The duplicate path comes first, then `[🧹]`, then the full canonical path to reference
+**Chair duplicate marking (two commands per duplicate pair):**
+- @[Graph][KeepCanonical][older/better path] - marks canonical version
+- @[Graph][MarkDuplicate][newer duplicate path] - marks path to hide
 - This makes it machine-parseable so other specialists can easily find the canonical path to vote on
 
 **Example workflow with vote and node migration:**
@@ -1291,7 +1294,9 @@ Phase 3:
 Specialist B: @[Graph][Update][Q:single][What is approach?][A][Phased approach][👍][Allows validation]
 
 Phase 4:
-Chair: @[Graph][Update][Q:single][What is approach?][A][Phased rollout][🧹][Q:single][What is approach?][A][Phased approach][Duplicate - "Phased approach" has 5 votes and captures same meaning]
+Chair: 
+@[Graph][KeepCanonical][Q:single][What is approach?][A][Phased approach]
+@[Graph][MarkDuplicate][Q:single][What is approach?][A][Phased rollout]
 
 Phase 5:
 Specialist A: @[All] I see I voted on "Phased rollout" which is now marked duplicate of "Phased approach".
@@ -1314,21 +1319,24 @@ This creates natural vote consolidation AND structure migration to the canonical
 **Vote Schema (Emoji-based for clarity):**
 
 **🔥 CRITICAL - USE EXACT EMOJIS (not symbols):**
-- Specialists use **thumbs emojis**: `[👍]`, `[👎]`, and **duplicate marker**: `[🧹]`
+- Specialists use **thumbs emojis**: `[👍]`, `[👎]`
+- Chair uses **duplicate operations**: `@[Graph][KeepCanonical]`, `@[Graph][MarkDuplicate]`
 - Users use **decision emojis**: `[✅]`, `[❌]`, `[➖]`
-- ✅ ALWAYS use emojis: `[👍]`, `[👎]`, `[🧹]`, `[✅]`, `[❌]`, `[➖]`
+- ✅ ALWAYS use emojis: `[👍]`, `[👎]`, `[✅]`, `[❌]`, `[➖]`
+- 🧹 Badge appears in UI when Chair marks duplicates (not a command emoji)
 
 **Specialist Votes (Advisory):**
 - **`[👍]`** = upvote/recommend - "I recommend this direction"
 - **`[👎]`** = downvote/concern - "I have concerns about this"
-- **`[🧹]`** = duplicate marker **(Chair only)** - "Another path already captures this same context"
-  - **Syntax**: `@[Graph][Update][duplicate path][🧹][canonical path]`
-  - **Chair's role**: At end of each phase, review all @[Graph][Create] operations and mark when you see a NEWER path that's semantically the same as an EARLIER path
-  - Compare both EXACT text matches AND semantic similarity (same meaning, different wording)
+
+**Chair Duplicate Marking (Chair only):**
+- Chair uses: `@[Graph][KeepCanonical][path]` + `@[Graph][MarkDuplicate][path]`
+- Two commands per duplicate pair - one to keep, one to mark as duplicate
+  - **Chair's role**: At end of each phase, review all @[Graph][Create] operations
+  - Mark when you see a NEWER path semantically identical to an EARLIER path
+  - Compare EXACT text matches AND semantic similarity (same meaning, different wording)
   - Consider full path context when determining if Q->A pairs are duplicates
   - Mark the newer duplicate, keep the earlier path as canonical
-  - After `[🧹]`, include the full canonical path so it's machine-parseable
-  - Example: `@[Graph][Update][Q:single][What?][A][Newer wording][🧹][Q:single][What?][A][Original wording]`
   - **All specialists - actions when you see `[🧹]` from Chair**:
     1. **For new votes**: Skip the duplicate path, vote on the referenced canonical path instead
     2. **Don't extend duplicates**: Never add follow-up questions or answers under the duplicate path - extend the canonical path instead
@@ -3087,17 +3095,21 @@ Mark ALL other semantically identical paths as duplicates pointing to the canoni
 
 CRITICAL: This section defines your ONLY allowed output.
 
-For each duplicate found, output:
-@[Graph][Update][duplicate_path][🧹][canonical_path]
+For each duplicate pair found, output TWO commands (one pair per duplicate):
+1. @[Graph][KeepCanonical][path_to_keep]
+2. @[Graph][MarkDuplicate][path_to_remove]
 
 Where:
-- [duplicate_path] = the NEWER duplicate (the one to HIDE/MARK)
-- [🧹] = the broom marker (emoji)
-- [canonical_path] = the OLDER canonical (the one to KEEP)
+- KeepCanonical = The OLDER or BETTER path (the one users will see)
+- MarkDuplicate = The NEWER or WORSE duplicate (will be hidden from users)
+- The two paths MUST be DIFFERENT (never use same path in both commands!)
 
-CRITICAL: The duplicate and canonical must be DIFFERENT paths (not the same path twice!)
-If item 1 and item 14 are duplicates, mark item 14 (newer) as duplicate of item 1 (older):
-@[Graph][Update][item_14_path][🧹][item_1_path]
+CRITICAL: Each duplicate pair needs BOTH commands.
+CRITICAL: Never output the same path in both KeepCanonical and MarkDuplicate!
+
+If item 1 and item 14 are duplicates (keep item 1, remove item 14):
+@[Graph][KeepCanonical][item_1_path]
+@[Graph][MarkDuplicate][item_14_path]
 
 If no duplicates found, output exactly:
 No duplicates found.
@@ -3105,8 +3117,10 @@ No duplicates found.
 EXAMPLES OF CORRECT OUTPUT:
 
 If duplicates found:
-@[Graph][Update][Q:single][How should access work?][A][Smart lock code][🧹][Q:single][What access method?][A][Lockbox or smart lock]
-@[Graph][Update][Q:single][What is priority?][A][Minimize stress][🧹][Q:single][What is priority?][A][Minimize cat stress]
+@[Graph][KeepCanonical][Q:single][What access method?][A][Lockbox or smart lock]
+@[Graph][MarkDuplicate][Q:single][How should access work?][A][Smart lock code]
+@[Graph][KeepCanonical][Q:single][What is priority?][A][Minimize cat stress]
+@[Graph][MarkDuplicate][Q:single][What is priority?][A][Minimize stress]
 
 If no duplicates:
 No duplicates found.
@@ -3123,22 +3137,28 @@ SPECIAL CASES:
 - Nested paths: Compare the FINAL Q->A segment - a nested question under one answer may duplicate a top-level question elsewhere
 
 CRITICAL VALIDATION RULES - NEVER VIOLATE THESE:
-1. **NEVER mark an answer as duplicate of its parent question**
-   - WRONG: @[Graph][Update][Q:single][What?][A][Option 1][🧹][Q:single][What?]
-   - An answer under a question is NOT a duplicate of that question!
+1. **NEVER use the same path in both KeepCanonical and MarkDuplicate**
+   - WRONG:
+     @[Graph][KeepCanonical][Q:single][What?][A][Option 1]
+     @[Graph][MarkDuplicate][Q:single][What?][A][Option 1]
+   - The SAME path cannot be both kept AND removed!
 
-2. **NEVER mark a question as duplicate of its own answer**
-   - WRONG: @[Graph][Update][Q:single][What?][🧹][Q:single][What?][A][Option 1]
+2. **NEVER mark an answer as duplicate of its parent question**
+   - WRONG:
+     @[Graph][KeepCanonical][Q:single][What?]
+     @[Graph][MarkDuplicate][Q:single][What?][A][Option 1]
+   - An answer is NOT a duplicate of its parent question!
+
+3. **NEVER mark a question as duplicate of its own answer**
+   - WRONG:
+     @[Graph][KeepCanonical][Q:single][What?][A][Option 1]
+     @[Graph][MarkDuplicate][Q:single][What?]
    - A question is NOT a duplicate of an answer under it!
-
-3. **Duplicate and canonical must be DIFFERENT complete paths**
-   - WRONG: @[Graph][Update][Q:single][What?][🧹][Q:single][What?]
-   - Same path cannot be marked as its own duplicate!
 
 4. **Only compare paths at the SAME STRUCTURAL LEVEL**
    - Compare question to question: [Q:single][text] vs [Q:single][text]
    - Compare answer to answer: [Q][text][A][text] vs [Q][text][A][text]
-   - NEVER compare question-only to question+answer paths!
+   - NEVER mark different structural levels as duplicates!
 
 ================================================================================
 CHECKPOINT - CONFIRM YOUR TASK BEFORE RESPONDING
@@ -3152,7 +3172,7 @@ C) Provide synthesis or recommendations
 CORRECT ANSWER: A
 
 Your response must be ONLY:
-- @[Graph][Update][...][🧹][...] commands (one per line), OR
+- @[Graph][KeepCanonical][...] and @[Graph][MarkDuplicate][...] command pairs, OR
 - "No duplicates found."
 
 Nothing else. No prose. No explanations. No recommendations.

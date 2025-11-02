@@ -15,7 +15,7 @@
       </span>
       <h3 class="question-text">
         <span :class="{ 'question-text-strikethrough': isDuplicate(path) }">{{ questionText }}</span>
-        <span v-if="isDuplicate(path)" class="duplicate-indicator" :title="`Use instead: ${getCanonicalPath(path)}`">🧹</span>
+        <span v-if="isDuplicate(path)" class="duplicate-indicator" title="Marked as duplicate by Chair">🧹</span>
       </h3>
       <div class="question-actions">
         <button 
@@ -36,7 +36,7 @@
         <span 
           v-if="tally.duplicates > 0" 
           class="duplicate-badge"
-          :title="tally.canonical_path ? `Duplicate of: ${tally.canonical_path}` : 'Marked as duplicate by Chair'"
+          title="Marked as duplicate by Chair"
         >
           🧹
         </span>
@@ -91,8 +91,8 @@
       </details>
     </div>
 
-    <!-- Add thought button and form for question -->
-    <div v-if="!isDuplicate(path)" class="add-thought-section">
+    <!-- Add thought button and form for question (hidden for Q:open - free-text input IS the response) -->
+    <div v-if="!isDuplicate(path) && questionType !== 'open'" class="add-thought-section">
       <button 
         v-if="!showQuestionThoughtForm"
         @click.stop="showQuestionThoughtForm = true"
@@ -131,11 +131,19 @@
     <div v-if="isExpanded && directAnswers.length > 0" class="answers-container">
       <div v-if="questionType === 'open'" class="open-answer">
         <textarea
+          v-model="questionThoughtText"
           :name="sanitizeId(path)"
           rows="3"
           placeholder="Enter your response..."
           class="open-textarea"
         ></textarea>
+        <button 
+          @click.stop="submitQuestionThought"
+          :disabled="!questionThoughtText.trim()"
+          class="submit-open-button"
+        >
+          Submit Response
+        </button>
       </div>
 
       <div v-else class="answer-options">
@@ -167,7 +175,7 @@
                     <span class="new-count">{{ getNewDescendantsCountForAnswer(answerPath) }}</span>
                   </span>
                   <span :class="{ 'answer-text-strikethrough': isDuplicate(answerPath) }">{{ extractAnswerText(answerPath) }}</span>
-                  <span v-if="isDuplicate(answerPath)" class="duplicate-indicator" :title="`Use instead: ${getCanonicalPath(answerPath)}`">🧹</span>
+                  <span v-if="isDuplicate(answerPath)" class="duplicate-indicator" title="Marked as duplicate by Chair">🧹</span>
                 </span>
                 <div class="answer-actions">
                   <button 
@@ -187,7 +195,7 @@
                 <span 
                   v-if="getAnswerTally(answerPath).duplicates > 0" 
                   class="duplicate-badge"
-                  :title="getAnswerTally(answerPath).canonical_path ? `Duplicate of: ${getAnswerTally(answerPath).canonical_path}` : 'Marked as duplicate by Chair'"
+                  title="Marked as duplicate by Chair"
                 >
                   🧹
                 </span>
@@ -388,6 +396,9 @@ export default {
     
     // Check if this question OR any nested questions under selected answers are pending
     const isPending = computed(() => {
+      // Force Vue to track changes to selectionsAtLastSubmit (watch for any key changes)
+      const submittedKeys = Object.keys(props.selectionsAtLastSubmit)
+      
       // First check if this question itself is pending
       if (props.isQuestionPending(props.path)) {
         return true
@@ -589,13 +600,9 @@ export default {
           // Check if this is a question node (has Q: after the answer text)
           const isQuestionNode = brackets.length > 2 && brackets[2] && brackets[2].startsWith('Q:')
           
-          // Filter out X'd nodes
+          // Filter out question nodes, X'd nodes, and duplicates
           if (isQuestionNode || isNodeXed(path)) continue
-          
-          // Filter out duplicates if hideDuplicates is enabled
-          if (shouldHideDupes && isDuplicate(path)) {
-            continue
-          }
+          if (shouldHideDupes && isDuplicate(path)) continue
           
           answers.push(path)
         }
@@ -603,9 +610,12 @@ export default {
       
       // VIEWPORT PINNING: If question is in viewport, freeze the answer list
       // Do NOT add new nodes while user is viewing this question
-      if (isInViewport.value && pinnedAnswerOrder.value) {
-        // Return ONLY the pinned answers (no new nodes)
-        const result = pinnedAnswerOrder.value.filter(a => answers.includes(a))
+      if (isInViewport.value && pinnedAnswerOrder.value && pinnedAnswerOrder.value.length > 0) {
+        // Return pinned answers + any NEW answers not in pinned list (same fix as root questions)
+        const pinnedStillExist = pinnedAnswerOrder.value.filter(a => answers.includes(a))
+        const pinnedSet = new Set(pinnedStillExist)
+        const newAnswers = answers.filter(a => !pinnedSet.has(a))
+        const result = [...pinnedStillExist, ...newAnswers]
         return result
       }
       
@@ -1110,7 +1120,10 @@ export default {
       
       // Reset form
       questionThoughtText.value = ''
-      showQuestionThoughtForm.value = false
+      // For Q:open, keep textarea visible; for others, hide the form
+      if (questionType.value !== 'open') {
+        showQuestionThoughtForm.value = false
+      }
     }
 
     function cancelQuestionThought() {
@@ -1837,6 +1850,28 @@ export default {
 }
 
 .submit-thought-button:disabled {
+  background: #a0aec0;
+  cursor: not-allowed;
+}
+
+.submit-open-button {
+  padding: 0.5rem 1rem;
+  margin-top: 0.5rem;
+  border: none;
+  border-radius: 4px;
+  background: #5a67d8;
+  color: white;
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 500;
+  transition: background 0.2s;
+}
+
+.submit-open-button:hover:not(:disabled) {
+  background: #4c51bf;
+}
+
+.submit-open-button:disabled {
   background: #a0aec0;
   cursor: not-allowed;
 }
