@@ -1,28 +1,33 @@
 
-# User submission from web UI at 2025-11-02T19:42:39.044Z
-@[Graph][Update][Q:multiple][Which ethical priorities should guide the sitter's behavior?][A][Respect cat autonomy and avoid forced handling][✅]
-@[Graph][Update][Q:multiple][Which ethical priorities should guide the sitter's behavior?][A][Follow emergency veterinary protocol with owner consent and spending cap][✅]
-@[Graph][Update][Q:multiple][Which ethical priorities should guide the sitter's behavior?][A][Minimize noise and avoid startling the cats][✅]
-@[Graph][Update][Q:multiple][Which ethical priorities should guide the sitter's behavior?][A][Respect homeowner privacy; disclose and obtain consent for cameras and recordings][✅]
-@[Graph][Update][Q:multiple][What verification should you require before hiring a sitter?][A][References from recent clients][✅]
-@[Graph][Update][Q:multiple][What verification should you require before hiring a sitter?][A][Meet-and-greet or brief trial visit][✅]
-@[Graph][Update][Q:multiple][What verification should you require before hiring a sitter?][A][Background or ID verification][✅]
-@[Graph][Update][Q:multiple][What verification should you require before hiring a sitter?][A][References from recent clients][Q:single][How many references should you require?][A][Two references][✅]
-@[Graph][Update][Q:multiple][What practical instructions should be documented for the sitter?][A][Exact feeding portions and timing][✅]
-@[Graph][Update][Q:multiple][What practical instructions should be documented for the sitter?][A][Litter cleaning frequency and disposal method][✅]
-@[Graph][Update][Q:multiple][What practical instructions should be documented for the sitter?][A][House rules: no shoes indoors, no slamming doors, speak quietly][✅]
-@[Graph][Update][Q:multiple][What practical instructions should be documented for the sitter?][A][Location of supplies, vet contact, and keys][✅]
-@[Graph][Update][Q:single][Who should the sitter contact or authorize in an emergency?][A][Call vet and authorize urgent treatment if owners unreachable][✅]
-@[Graph][Update][Q:single][What level of interaction do you want from the sitter?][A][Moderate - brief calm visits to help cats acclimate][✅]
-@[Graph][Update][Q:single][How will the sitter access your home?][A][Give sitter a spare physical key][✅]
-@[Graph][Update][Q:multiple][Which sitter traits are required or preferred?][A][Quiet and walks softly][✅]
-@[Graph][Update][Q:multiple][Which sitter traits are required or preferred?][A][Experience with shy or hiding cats][✅]
-@[Graph][Update][Q:multiple][Which sitter traits are required or preferred?][A][References from recent clients][✅]
-@[Graph][Update][Q:single][Do you prefer hiring through an agency or an independent sitter?][A][Independent sitter from referrals or local ads][✅]
-@[Graph][Update][Q:single][Should the sitter be the same person for all visits?][A][Yes - same sitter for every visit][✅]
+# User submission from web UI at 2025-11-02T20:02:30.092Z
+@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Agrees to quiet entry/exit protocol (no slamming, soft shoes)][✅]
+@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Has an emergency plan and written vet authorization][✅]
+@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Understands and follows step-by-step feeding and litter instructions][✅]
+@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Quiet and experienced with shy cats][✅]
+@[Graph][Update][Q:multiple][Which sitter requirements are essential?][A][Background checked and references available][✅]
 
-# User submission from web UI at 2025-11-02T19:42:51.471Z
-@[Graph][Update][Q:multiple][What verification should you require before hiring a sitter?][A][References from recent clients][Q:single][How many references should you require?][A][Two references][✅]
+# User submission from web UI at 2025-11-02T20:02:38.722Z
+@[Graph][Update][Q:single][Should the sitter be authorized to seek emergency veterinary care?][A][Yes - authorize up to an owner-specified spending cap][✅]
 
-# User clicked Continue Phase from web UI at 2025-11-02T13:45:20.650882
+# User submission from web UI at 2025-11-02T20:02:47.578Z
+@[Graph][Update][Q:single][What level of updates do you want during visits?][A][Short text once per day][✅]
+
+# User submission from web UI at 2025-11-02T20:02:53.943Z
+@[Graph][Update][Q:single][How should the sitter access your home?][A][Leave physical key with sitter for the weekend (less recommended)][✅]
+
+# User submission from web UI at 2025-11-02T20:03:01.745Z
+@[Graph][Update][Q:multiple][Which sitter qualities are must-haves?][A][Quiet and walk softly][✅]
+@[Graph][Update][Q:multiple][Which sitter qualities are must-haves?][A][Experience with shy or avoidant cats][✅]
+@[Graph][Update][Q:multiple][Which sitter qualities are must-haves?][A][References with contact information][✅]
+@[Graph][Update][Q:multiple][Which sitter qualities are must-haves?][A][Comfortable with short twice-daily visits (no long stays)][✅]
+
+# User clicked Continue Phase from web UI at 2025-11-02T14:03:48.641934
+@[System][ContinuePhase]
+
+# User submission from web UI at 2025-11-02T20:05:25.358Z
+@[Graph][Update][Q:single][Should the sitter be authorized to seek emergency veterinary care?][A][Yes - authorize up to an owner-specified spending cap][Q:single][What emergency spending cap should you set?][A][$500-$1000][✅]
+@[Graph][Update][Q:single][Will you allow photos or camera monitoring during visits?][A][No - no photos or cameras allowed][✅]
+@[Graph][Update][Q:single][May the sitter take photos or videos during visits?][A][No photos or videos allowed][✅]
+
+# User clicked Continue Phase from web UI at 2025-11-02T14:05:36.808063
 @[System][ContinuePhase]

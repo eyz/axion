@@ -944,8 +944,8 @@ export default {
     function getAnswerVotedBy(answerPath) {
       const tally = getAnswerTally(answerPath)
       return {
-        up: tally.up_by || [],
-        down: tally.down_by || []
+        up: [...new Set(tally.up_by || [])],
+        down: [...new Set(tally.down_by || [])]
       }
     }
 
